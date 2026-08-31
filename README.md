@@ -9,7 +9,7 @@
 ![demo](docs/demo.gif)
 
 ```text
-ef notes            # every file and folder whose name contains "notes" — about 15 ms
+ef notes            # every file and folder whose name contains "notes" — about 14 ms
 ef                  # interactive: type to narrow, Enter prints the path
 ef du C:\Users      # what's eating space under C:\Users — straight from the index
 ```
@@ -26,7 +26,7 @@ Download the zip from [Releases](https://github.com/kyo5uke/everyfind/releases),
 .\install.ps1
 ```
 
-It puts the binaries in `%ProgramFiles%\Everyfind`, adds the folder to `PATH`, registers and starts the indexing service, and waits for the first index. For a volume of about 6 million files, expect anywhere from 30 seconds to about 3 minutes: building the index reads the whole Master File Table, several gigabytes of it, so the slow case is a cold disk cache — which is exactly what a first install on a machine that has been doing something else looks like. Every start after that resumes from a snapshot in a couple of seconds.
+It puts the binaries in `%ProgramFiles%\Everyfind`, adds the folder to `PATH`, registers and starts the indexing service, and waits for the first index. Expect roughly 10 seconds on a fast NVMe desktop (measured: 4.7M files) and up to a few minutes on a laptop with a cold disk cache: building the index reads the whole Master File Table, several gigabytes of it — which is exactly what a first install on a machine that has been doing something else looks like. Every start after that resumes from a snapshot in a couple of seconds.
 
 That's the only time Administrator is asked for. Both registering the service and reading the raw volume need it ([why](#why-does-the-indexer-need-administrator)).
 
@@ -92,7 +92,7 @@ $dir = ef; cd $dir    # PowerShell: jump to a directory you picked
 
 ### Disk usage
 
-`ef du` answers "what's eating my disk" from the same resident index. Aggregating the whole volume takes about 139 ms, with no disk I/O at query time.
+`ef du` answers "what's eating my disk" from the same resident index. Aggregating the whole volume takes about 0.1 s (96 ms median end-to-end), with no disk I/O at query time.
 
 ```text
 ef du                 # the biggest things on the volume
@@ -197,20 +197,32 @@ That puts everything back. The crawl-scope rule is removed only if this is what 
 
 ## Benchmarks
 
-What the difference looks like, with stock tools as the baseline: `dir /s /b | findstr` walking the volume with no index, `ef-index` building the whole index from the MFT and then answering a single query, and `ef` asking the resident daemon:
+Filename search over a real C: volume with ~5.0M MFT entries (4.8M live) —
+everyfind's resident index vs. [fd](https://github.com/sharkdp/fd) (an
+excellent parallel walker, but one that must re-scan the directory tree on
+every query):
 
-![Command line: no index vs building the index vs the resident index](docs/everyfind-vs-windows.gif)
-
-Three separate recordings, caches dropped before each, aligned at Enter; the `Measure-Command` output on screen is what each run actually took. ×8 and ×64 mark fast-forward.
-
-Filename search over a real C: volume with about 5.9M MFT entries — Everyfind's resident index against [fd](https://github.com/sharkdp/fd), an excellent parallel walker that has to re-scan the directory tree on every query:
-
-| Query over all of C: (~5.9M entries) | Everyfind (warm daemon) | fd 10.4.2 (scan per query) |
+| Query over all of C: (~5.0M entries) | everyfind (warm daemon) | fd 10.5.0 (scan per query) |
 |---|---:|---:|
-| find `kernel32` by name | **≈ 15 ms** end-to-end | 104.6 s mean (67.9–128.4 s) |
-| whole-volume disk usage (`ef du C:\`) | **139 ms** | — |
+| find `kernel32` by name | **13.5 ms** median end-to-end | 3.0-4.0 s warm (18.2 s first run) |
+| whole-volume disk usage (`ef du C:\`) | **96 ms** median | - |
 
-**Methodology.** Same machine (Intel Core Ultra 7 258V laptop, AC + a High-Performance power plan, elevated terminal, live volume). Everyfind: `ef kernel32` end-to-end — process start + named-pipe round trip + parallel index scan — median 15.3–16.4 ms, measured through a `CreateProcess`-direct harness (a shell adds ~55 ms of its own); the search round trip alone is ~9–11 ms. fd: `fd -uu kernel32 C:/` (hidden + no-ignore, so it sees what the MFT index sees), hyperfine with 1 warmup + 3 runs; the spread is filesystem-cache dependent. Hit counts differed slightly between the tools (118 vs 151), because the runs were days apart on a live system volume. Everyfind pays its cost once, at daemon start; every query after that is answered from memory.
+**Methodology.** Same machine (Ryzen 9 9950X3D desktop, NVMe, Windows 11 Pro,
+elevated terminal, live volume). everyfind: `ef kernel32` end-to-end - process
+start + named-pipe round trip + parallel index scan - n=100 via the
+`CreateProcess`-direct harness in `examples/bench_ef.rs` (a shell adds ~55 ms
+of its own): min 12.3 / median 13.5 / p95 16.1 ms; the pipe round trip alone is
+3.9 ms median (n=200). `ef du C:\` end-to-end: 92-102 ms over 5 runs. fd:
+`fd -uu kernel32 C:/` (hidden + no-ignore, so it sees what the MFT index sees),
+1 warmup + 3 timed runs: 18.2 s, then 3.96 / 3.13 / 3.04 s - the first run pays
+for a cold filesystem cache. Hit counts differ (22 vs 154) because most
+`kernel32*` files are WinSxS hardlinks and everyfind v0.1 indexes one name per
+file (see Known limitations below).
+
+An earlier run of the same benchmark on a Core Ultra 7 258V laptop: everyfind
+~15 ms, fd 104.6 s mean (67.9-128.4 s). Across an ~11x hardware gap the scan
+went from minutes to seconds while the indexed answer barely moved - the scan
+cost scales with your hardware; the index answers from memory either way.
 
 ## How it works
 
