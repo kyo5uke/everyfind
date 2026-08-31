@@ -1,0 +1,49 @@
+# What every Everyfind process shares, and nothing else.
+#
+# Two things cross the boundary between the parts of everyfind: how to reach the daemon, and
+# what the user asked to leave out of a search. The daemon, the CLI and the DLL that answers
+# Explorer's search box all need both, and none of them needs the others' internals — so this
+# is where those two live.
+#
+# It exists because of a bug rather than for tidiness. The protocol version moved from 4 to 5
+# while a four-day-old daemon was still running, and every query using the new syntax came back
+# with zero matches, silently, for days. With the protocol inside the crate that also holds the
+# index, "which version is the DLL speaking" was not a question anything could be asked. Here
+# it is a dependency with a version on it.
+#
+# The other reason is weight: `searchshim` needed `Request` and `SearchHit`, and to get them it
+# compiled the MFT reader, the USN watcher, the snapshot format and the TUI.
+[package]
+name = "everyfind-ipc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Everyfind's daemon protocol and shared client configuration"
+license = "MIT OR Apache-2.0"
+authors = ["kyo5uke"]
+repository = "https://github.com/kyo5uke/everyfind"
+publish = false
+
+[dependencies]
+# The wire format: serde derives the shapes, bincode encodes them. Both sides of every pipe in
+# the project agree on this pair and on nothing else.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# Named pipes, the ACL on the server end, and the handle plumbing. Raw FFI is all this needs —
+# the full `windows` crate's COM machinery has no place in a crate the daemon links.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    # `ReadFile`, `WriteFile` and `ConnectNamedPipe` all take an `OVERLAPPED`, which lives
+    # here. It was never listed while this code sat in the main crate: that crate happened to
+    # enable it for the volume reader, and Cargo's feature unification quietly supplied it.
+    # Splitting the crate is what asked the question out loud.
+    "Win32_System_IO",
+] }
+
+anyhow = "1"
+thiserror = "2"

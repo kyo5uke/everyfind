@@ -1,0 +1,34 @@
+# Redirect the build toolchain's temp dir into the project (../build-tmp) so MSVC's link.exe
+# writes its .tmp files there instead of %Temp%. On this machine (and other MSVC + Windows
+# Defender setups) real-time protection intermittently locks freshly-created .tmp files in
+# %Temp%, failing the link with LNK1104 ("cannot open file … .tmp") — NOT a disk-space issue.
+# Pointing TMP/TEMP at an in-repo folder avoids it, and because this config is committed it
+# reproduces identically locally and in CI (no per-machine antivirus exclusion needed).
+#
+# `[env]` applies ONLY to processes cargo spawns (rustc → link.exe), so runtime binaries
+# (efd/ef/bench_ef run directly from target/) still use the real %Temp% — no runtime impact.
+# `relative = true` resolves `build-tmp` against the repo root (the parent of this .cargo dir),
+# so the path is portable; `force = true` overrides the ambient TMP/TEMP.
+[env]
+TMP = { value = "build-tmp", relative = true, force = true }
+TEMP = { value = "build-tmp", relative = true, force = true }
+
+# Link the C runtime statically, so a released binary has no prerequisites at all.
+#
+# Rust's MSVC target links it dynamically by default, which puts `vcruntime140.dll` in the
+# import table — and that DLL is **not part of Windows**. It arrives with the Visual C++
+# redistributable, which a development machine always has and a clean one often does not, so
+# the failure lands on exactly the person least able to read it: "VCRUNTIME140.dll was not
+# found" before `main` runs, on first launch, on someone else's PC.
+#
+# Measured on the built `ef.exe` before this: `vcruntime140.dll` imported alongside the
+# `api-ms-win-crt-*` façades (those are the Universal CRT, which *does* ship with Windows 10
+# and later). Afterwards there is nothing outside Windows itself to install.
+#
+# Costs a larger binary and a private CRT state per module. The second is the one to keep in
+# mind: `searchshim.dll` is loaded into explorer.exe, so it now carries its own CRT rather
+# than sharing the host's. That is sound because nothing CRT-owned crosses the boundary — no
+# allocation made on one side is freed on the other, and the shim's only exports return
+# HRESULTs and COM pointers.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

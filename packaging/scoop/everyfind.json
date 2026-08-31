@@ -1,0 +1,28 @@
+{
+    "version": "0.1.0",
+    "description": "Instant filename search for Windows, in your terminal (NTFS MFT + USN journal)",
+    "homepage": "https://github.com/kyo5uke/everyfind",
+    "license": "MIT OR Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/kyo5uke/everyfind/releases/download/v0.1.0/everyfind-x86_64-pc-windows-msvc-v0.1.0.zip",
+            "hash": "REPLACE-WITH-SHA256SUMS-VALUE-ON-FIRST-RELEASE"
+        }
+    },
+    "bin": [
+        "ef.exe",
+        "efd.exe"
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/kyo5uke/everyfind/releases/download/v$version/everyfind-x86_64-pc-windows-msvc-v$version.zip",
+                "hash": {
+                    "url": "https://github.com/kyo5uke/everyfind/releases/download/v$version/SHA256SUMS"
+                }
+            }
+        }
+    },
+    "notes": "One-time setup from an elevated terminal: 'ef service install' then 'ef service start'. The ef client itself runs unelevated."
+}

@@ -1,0 +1,23 @@
+Everyfind — third-party notices
+===============================
+
+Everyfind itself is licensed MIT OR Apache-2.0; those two licences travel with it as
+LICENSE-MIT and LICENSE-APACHE. This file covers everything else in the binaries.
+
+Every dependency is permissive — nothing here is copyleft — but MIT and Apache-2.0 both ask
+that their notices be included with binary distributions, so they are reproduced in full
+below, once per licence, with the crates each one covers.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{name}}
+--------------------------------------------------------------------------------
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}}  ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{text}}
+
+{{/each}}

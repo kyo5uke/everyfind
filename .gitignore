@@ -1,0 +1,25 @@
+/target
+
+# Test-volume fixtures produced by scripts/make-test-volume.ps1
+*.vhdx
+*.vhd
+
+# MSVC link.exe temp dir (TMP/TEMP redirected here by .cargo/config.toml) — keep the dir,
+# ignore its contents.
+/build-tmp/*
+!/build-tmp/.gitkeep
+
+# Editor / OS cruft
+/.vs/
+.DS_Store
+Thumbs.db
+
+# Internal development documents (not published) / 内部開発ドキュメント(非公開)
+/MILESTONES.md
+/docs/M*-PLAN.md
+/docs/STRATEGY.md
+# 作業メモ全般。*.local.md は常に非公開。
+*.local.md
+
+# Cargo.lock IS committed (this crate ships a binary).
+THIRD-PARTY-NOTICES.txt

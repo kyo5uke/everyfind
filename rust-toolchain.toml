@@ -1,0 +1,13 @@
+# Pinned to the MSVC host toolchain for distribution (M6a): it drops the mingw runtime
+# dependency and shaves the `ef` client's process-start overhead (the M3 latency headline).
+# `windows-sys` links fine on MSVC (it ships both GNU and MSVC import libs), so the raw Win32
+# FSCTL calls are unaffected.
+#
+# NOTE: MSVC's link.exe writes temp files to TMP/TEMP; `.cargo/config.toml` redirects those
+# into ./build-tmp to dodge an antivirus lock on %Temp% (LNK1104).
+#
+# The GNU toolchain (`stable-x86_64-pc-windows-gnu`) still *compiles* the crate (kept as a
+# fallback, not a tested/distributed target); build it with
+# `rustup run stable-x86_64-pc-windows-gnu cargo build` if MSVC is unavailable.
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"

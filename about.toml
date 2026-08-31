@@ -1,0 +1,31 @@
+# cargo-about: which licences are acceptable in a shipped Everyfind binary.
+#
+# The list is a statement of what has been checked, not a wish: `cargo about` fails the build
+# when a dependency arrives under something not named here, so a copyleft crate cannot enter
+# the tree unnoticed — which is the only way that mistake ever happens.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+
+# Only what actually ships. The binaries are built for one target, so notices for the others
+# would be noise at best and a false claim at worst.
+targets = ["x86_64-pc-windows-msvc"]
+
+# Build- and dev-only crates do not end up in the binaries, so their notices do not belong in
+# a file that says "this is what is inside what you downloaded".
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# A private crate cannot be published and is ours anyway.
+private = { ignore = true }

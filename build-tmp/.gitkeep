@@ -1,0 +1,3 @@
+# Keep this directory in git. MSVC's link.exe writes its temp files here (TMP/TEMP are
+# redirected to it by ../.cargo/config.toml) to dodge the antivirus real-time-protection
+# lock on %Temp% .tmp files that otherwise fails the MSVC link with LNK1104.

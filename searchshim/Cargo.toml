@@ -1,0 +1,72 @@
+# The engine behind `ef explorer engine`: a DLL registered per-user in front of the Windows
+# Search OLE DB providers. It forwards the whole conversation to the genuine provider and
+# replaces only the rowset `Execute` returns, so Explorer's own search box answers with
+# Everyfind while the breadcrumb, view and navigation stay native.
+#
+# Its own workspace, so the crate everyone installs never pulls in the COM plumbing: the
+# daemon and CLI must not link `windows`/`implement` just to ship a search DLL. The release
+# workflow builds it here and drops the result into the archive as ef_search_engine.dll.
+[package]
+name = "searchshim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stamped into the DLL by build.rs — see build.rs for why this matters more here than
+# anywhere else in the tree.
+[package.metadata.winresource]
+CompanyName = "kyo5uke"
+ProductName = "Everyfind"
+FileDescription = "Everyfind Explorer search engine"
+LegalCopyright = "Licensed under MIT OR Apache-2.0"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+name = "searchshim"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Used by the `whatclsid` and `navsink` probes (COM interfaces the shim itself
+# does not need). Same 0.58 the main crate pins, so signatures match nse.
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Search",
+    "Win32_System_Search_Common",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_IndexServer",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The `#[implement]` macro expands to `windows_core::…` paths, so the crate must
+# be in scope by that name.
+windows-core = "0.58"
+
+# Results come from the running daemon over its named pipe. Only the protocol crate, not
+# Everyfind itself: this DLL needs `Request`, `SearchHit` and the excludes file, and used to
+# compile the MFT reader, the USN watcher and the snapshot format to reach them. It also means
+# a protocol bump shows up here as a version, which is the failure this crate exists to make
+# visible — a four-day-old daemon once answered every new-syntax query with zero matches.
+everyfind-ipc = { path = "../ipc" }
+
+[profile.release]
+opt-level = 2

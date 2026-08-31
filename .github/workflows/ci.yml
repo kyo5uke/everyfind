@@ -1,0 +1,63 @@
+# CI: format, lint, test on the distribution target (MSVC).
+#
+# - The toolchain is pinned by rust-toolchain.toml (stable-x86_64-pc-windows-msvc);
+#   `rustup toolchain install` with no arguments installs exactly that pin.
+# - The committed .cargo/config.toml redirects TMP/TEMP into ./build-tmp for
+#   cargo-spawned processes (MSVC link.exe vs. antivirus temp-file locks); the
+#   directory exists in a fresh checkout via the tracked build-tmp/.gitkeep.
+# - `cargo test` skips #[ignore] tests by design: those need an elevated terminal
+#   and touch the real SCM / volume (e.g. service_lifecycle_roundtrip).
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all` / `--workspace` throughout, because the workspace has a second member now:
+      # `ipc/` holds the daemon protocol. Without these flags the root package is all that
+      # runs, and the 23 wire-format tests — including the one pinning `PROTO_VERSION` — would
+      # have stopped running the moment they moved, silently, which is the exact failure that
+      # crate exists to prevent.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The Explorer search engine is a separate workspace (it is a cdylib that links the COM
+      # crates the shipped binaries must not), so none of the steps above reach it. It is
+      # released alongside ef.exe, so it gets the same three gates.
+      - name: Format (search engine)
+        run: cargo fmt --check
+        working-directory: searchshim
+
+      # `--lib --tests`, not `--all-targets`: searchshim/examples are the measurement probes
+      # used to read Explorer's OLE DB conversation, not shipped code. Holding throwaway
+      # diagnostics to -D warnings taxes the investigation without protecting anyone.
+      - name: Clippy (search engine)
+        run: cargo clippy --lib --tests -- -D warnings
+        working-directory: searchshim
+
+      - name: Test (search engine)
+        run: cargo test
+        working-directory: searchshim

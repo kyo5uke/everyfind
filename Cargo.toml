@@ -1,0 +1,147 @@
+# Two crates here, and a third out of the way. `ipc/` is the contract every Everyfind process
+# shares — the daemon protocol and the user's excludes — kept separate so a protocol version is
+# a dependency rather than an implementation detail of whichever crate happens to hold it.
+# `searchshim/` is the DLL that goes inside explorer.exe; it declares its own workspace so the
+# COM plumbing it needs (`windows`, `implement`) never reaches the binary everyone else
+# installs, and it depends on `ipc/` alone rather than on all of this.
+[workspace]
+members = ["ipc"]
+
+[package]
+name = "everyfind"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Instant filename search for Windows (a terminal Everything), powered by NTFS MFT + USN journal"
+license = "MIT OR Apache-2.0"
+authors = ["kyo5uke"]
+repository = "https://github.com/kyo5uke/everyfind"
+homepage = "https://github.com/kyo5uke/everyfind"
+readme = "README.md"
+keywords = ["search", "ntfs", "windows", "filesystem", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+build = "build.rs"
+
+# Windows version-resource fields stamped into ef.exe / efd.exe / ef-index.exe
+# by build.rs. A signed-looking, described binary is far less likely to trip an
+# ML heuristic like Bearfoos.B!ml (a metadata-less freshly-built exe is the
+# textbook false-positive shape). Also good hygiene: right-click → Properties →
+# Details now shows a real product/version.
+[package.metadata.winresource]
+CompanyName = "kyo5uke"
+ProductName = "Everyfind"
+FileDescription = "Everyfind - instant filename and content search for Windows"
+LegalCopyright = "Licensed under MIT OR Apache-2.0"
+
+# `cargo binstall everyfind` fetches the release zip instead of compiling. The URL
+# matches what .github/workflows/release.yml publishes; binaries sit at the archive
+# root (the layout docs/RELEASE.md describes).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.zip"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "zip"
+
+# Binary target `ef-index` is auto-detected from src/bin/ef-index.rs.
+# Library target `everyfind` is auto-detected from src/lib.rs.
+
+[features]
+# Exposes the FakeVolume test double (volume::fake). Not part of the public API —
+# enabled automatically for this crate's own tests via the self dev-dependency below.
+test-util = []
+
+[dev-dependencies]
+# Self-dependency so integration tests (tests/) see the crate with `test-util` on;
+# plain `cargo test` works while a downstream `cargo build` gets no FakeVolume.
+everyfind = { path = ".", features = ["test-util"] }
+
+# Stamps the Windows version resource (see [package.metadata.winresource]). Only
+# runs on windows targets; build.rs no-ops elsewhere so the crate still compiles
+# for a GNU/cross check.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+# The protocol and the excludes file, shared with `searchshim/` and with nothing else in
+# between. Re-exported below as `everyfind::ipc` / `everyfind::config` so the move cost no
+# caller a single path.
+everyfind-ipc = { path = "ipc" }
+
+# The grix engine — trigram content index +
+# ripgrep-compatible confirming scan; powers `ef content`. Library use inside the
+# *client only*: the daemon never links it, so name search stays exactly as
+# light as before. Shares the standalone grix index store (%LOCALAPPDATA%\grix),
+# so `ef content` and a grix CLI install reuse one content index per root.
+grix = "0.6"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon = "1"
+memchr = "2"
+# M7 query language: `regex:` / `pathregex:` terms. Already in the tree via
+# grix, so this costs no extra compile.
+regex = "1"
+# M2 snapshot persistence: index + journal cursor serialized via bincode's classic serde
+# API (1.x). serde derive on Entry / StringArena / Index.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+# Win32 backend + memory stats. Feature set confirmed by the probes; raw FSCTL codes
+# and USN struct layouts are hand-defined, so only these FFI modules are needed.
+# Win32_Security is required because CreateFileW references SECURITY_ATTRIBUTES.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    # M3 named-pipe IPC + ACL: CreateNamedPipeW/ConnectNamedPipe/WaitNamedPipeW live in
+    # Win32_System_Pipes; SDDL <-> SECURITY_DESCRIPTOR convert + GetSecurityInfo in
+    # Win32_Security_Authorization (probe P14 reads the DACL back).
+    "Win32_System_Pipes",
+    "Win32_Security_Authorization",
+    # efd --foreground Ctrl-C handling: SetConsoleCtrlHandler.
+    "Win32_System_Console",
+    # Explorer right-click integration (`ef shell install`): per-user HKCU
+    # context-menu keys via RegCreateKeyExW/RegSetValueExW/RegDeleteTreeW.
+    "Win32_System_Registry",
+    # M4 TUI clipboard (Ctrl+Y): self-built CF_UNICODETEXT write. OpenClipboard /
+    # EmptyClipboard / SetClipboardData / GetClipboardData / CloseClipboard live in
+    # Win32_System_DataExchange; GlobalAlloc / GlobalLock / GlobalUnlock / GlobalFree in
+    # Win32_System_Memory. CF_UNICODETEXT / GMEM_MOVEABLE are hand-defined (repo practice).
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    # M4 TUI Ctrl+E / Ctrl+O: ShellExecuteW (reveal in Explorer / open with the associated
+    # program) — no cmd.exe, path passed as a single wide string. SW_SHOWNORMAL hand-defined.
+    # ShellExecuteW's nShowCmd param type lives in Win32_UI_WindowsAndMessaging, so both are needed.
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# One COM interface, in one place: `ISearchCrawlScopeManager`, which the search-engine
+# installer uses to tell Explorer a drive is indexed (and to put that back on uninstall).
+# windows-sys is raw FFI only and cannot express a COM interface; the two crates coexist
+# happily. Confined to src/search_engine.rs — the features are exactly what that needs, and
+# the list shrank to three when the connector, the namespace extension and the Explorer
+# watcher were removed.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Search",
+] }
+
+# M3 Windows service: SCM registration + dispatcher + control handler. Wraps the SCM APIs
+# (windows-sys internally) so we do not hand-define them.
+windows-service = "0.7"
+
+# M4 TUI: terminal UI + backend. ratatui pulls unicode-width (display width for
+# full-width/emoji); crossterm is the console backend (raw mode, alternate screen on
+# stderr, key/resize events read from CONIN$). These are the only new *direct* crates in M4.
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

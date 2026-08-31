@@ -1,0 +1,74 @@
+# Release: on a v* tag, build the release binaries (ef.exe, efd.exe, ef-index.exe)
+# and attach them to a GitHub Release as a zip (+ SHA256SUMS).
+#
+# The archive is named `everyfind-x86_64-pc-windows-msvc-v<version>.zip` — the
+# pattern cargo-binstall probes by default, so `cargo binstall everyfind` can
+# resolve it without extra metadata.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      # The Explorer search engine lives in its own workspace, so it needs its own build.
+      # `ef explorer engine install` looks for ef_search_engine.dll beside ef.exe — without
+      # this step the released archive cannot install the integration at all.
+      - name: Build the Explorer search engine
+        run: cargo build --release --lib
+        working-directory: searchshim
+
+      # Every dependency is permissive (MIT / Apache-2.0 / Unlicense / Zlib / CC0 / BSL —
+      # nothing copyleft), but MIT and Apache-2.0 both ask for their notices to travel with
+      # binaries. Shipping only *our* two licence files met neither. Generated here rather
+      # than checked in so a new dependency cannot quietly go unlisted.
+      - name: Third-party notices
+        run: |
+          cargo install cargo-about --locked --features cli
+          cargo about generate --output-file THIRD-PARTY-NOTICES.txt about.hbs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart('v')
+          $name = "everyfind-x86_64-pc-windows-msvc-v$version"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/ef.exe, target/release/efd.exe, target/release/ef-index.exe dist/
+          # Renamed on the way in: the installer looks this name up beside ef.exe.
+          Copy-Item searchshim/target/release/searchshim.dll dist/ef_search_engine.dll
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, README.md, THIRD-PARTY-NOTICES.txt dist/
+          # The whole setup in one command, so the archive is usable without the README open
+          # beside it: elevation, PATH, service registration, and the first index.
+          Copy-Item packaging/install.ps1, packaging/uninstall.ps1 dist/
+          Compress-Archive -Path dist/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            everyfind-*.zip
+            SHA256SUMS
+          generate_release_notes: true
