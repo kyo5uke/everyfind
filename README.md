@@ -26,6 +26,11 @@ Download the zip from [Releases](https://github.com/kyo5uke/everyfind/releases),
 .\install.ps1
 ```
 
+If PowerShell refuses with *"is not digitally signed"* or *"running scripts is
+disabled"* — Windows blocks downloaded scripts by default — run it as
+`powershell -ExecutionPolicy Bypass -File .\install.ps1` instead (or
+`Unblock-File .\install.ps1` once, then run it normally).
+
 It puts the binaries in `%ProgramFiles%\Everyfind`, adds the folder to `PATH`, registers and starts the indexing service, and waits for the first index. Expect roughly 10 seconds on a fast NVMe desktop (measured: 4.7M files) and up to a few minutes on a laptop with a cold disk cache: building the index reads the whole Master File Table, several gigabytes of it — which is exactly what a first install on a machine that has been doing something else looks like. Every start after that resumes from a snapshot in a couple of seconds.
 
 That's the only time Administrator is asked for. Both registering the service and reading the raw volume need it ([why](#why-does-the-indexer-need-administrator)).
