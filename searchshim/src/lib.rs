@@ -582,7 +582,12 @@ unsafe fn query_for(cmd: *mut c_void) -> Option<(String, String)> {
                 // builds where the command's own IObjectWithSite is null this is the only
                 // reading left, and without it every Explorer search there silently defers to
                 // Windows.
-                match TERM.lock().ok().map(|g| g.clone()).filter(|t| !t.trim().is_empty()) {
+                match TERM
+                    .lock()
+                    .ok()
+                    .map(|g| g.clone())
+                    .filter(|t| !t.trim().is_empty())
+                {
                     Some(t) => {
                         log(&format!("QUERY: term from the SetSite capture = '{t}'"));
                         t
