@@ -35,6 +35,19 @@ It puts the binaries in `%ProgramFiles%\Everyfind`, adds the folder to `PATH`, r
 
 That's the only time Administrator is asked for. Both registering the service and reading the raw volume need it ([why](#why-does-the-indexer-need-administrator)).
 
+### What's in the package
+
+| | |
+|---|---|
+| `ef.exe` | the command you use: search, `ef du`, the TUI, and the `ef explorer engine` / `ef service` subcommands |
+| `efd.exe` | the indexing daemon. The service runs it; you never call it yourself |
+| `ef_search_engine.dll` | the Explorer integration. Explorer loads it only after `ef explorer engine install` |
+| `ef-index.exe` | the index engine on its own, for measurement: build an index from scratch and time it, save it to a snapshot, tail the USN journal — all in one process. Not needed for normal use; it is how the benchmarks in this README are reproduced |
+
+**If all you want is a faster Explorer search**, `.\install.ps1 -WithExplorer` does the whole
+thing in one command — index, service, and search box — and you need never type `ef` at all.
+Undo any time with `ef explorer engine uninstall`.
+
 To install from source, with Rust stable and the MSVC toolchain:
 
 ```text
