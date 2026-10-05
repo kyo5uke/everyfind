@@ -10,8 +10,10 @@
 //!   fast keystrokes always settles on the final query's results.
 //! - **Enter acts on the currently displayed list** (decision #3, fzf-like): it never waits
 //!   on an in-flight reply; because stale replies are dropped, "displayed" is always coherent.
-//!   Enter *opens* the selection (the obvious meaning); **Ctrl+Enter** prints its path to
-//!   stdout instead, which is what makes `vim $(ef)` compose.
+//!   At a terminal Enter *opens* the selection (the obvious meaning) and **Ctrl+Enter** prints
+//!   its path to stdout instead. When stdout is captured (`vim $(ef)`, `$dir = ef`) the path is
+//!   the only thing the caller can be after, so there Enter prints it too
+//!   ([`AppState::set_enter_prints`]).
 //!
 //! [`req_gen`]: AppState::req_gen
 //! [`on_response`]: AppState::on_response
@@ -27,7 +29,8 @@ pub enum Action {
     /// Issue a search for `query`, tagged with `gen`. The reply must be handed back via
     /// [`AppState::on_response`] with the same `gen`.
     Dispatch { gen: u64, query: String },
-    /// Ctrl+Enter: emit this absolute path on **stdout** and exit 0 (composability).
+    /// Ctrl+Enter, or Enter when stdout is captured: emit this absolute path on **stdout** and
+    /// exit 0 (composability).
     Select(String),
     /// Ctrl+Y: copy this path to the clipboard.
     Copy(String),
@@ -62,6 +65,9 @@ pub struct AppState {
     error: Option<String>,
     /// Rows available in the result viewport, for PgUp/PgDn. Updated by the shell on render.
     viewport_rows: usize,
+    /// Whether plain Enter prints the path rather than opening it. See
+    /// [`set_enter_prints`](Self::set_enter_prints).
+    enter_prints: bool,
 }
 
 impl AppState {
@@ -82,7 +88,24 @@ impl AppState {
             status: None,
             error: None,
             viewport_rows: 10,
+            enter_prints: false,
         }
+    }
+
+    /// Make plain Enter print the selected path (and exit) instead of opening it.
+    ///
+    /// For when stdout is captured: `vim $(ef)`, `$dir = ef`, `ef > picked.txt`. Whoever set
+    /// that up is waiting for a path on stdout, so opening the file in some other program
+    /// and leaving them waiting is the one thing Enter cannot usefully mean there. At a
+    /// terminal there is nobody to hand a path to, and Enter stays "open" (which is also what
+    /// the Explorer right-click entry relies on).
+    pub fn set_enter_prints(&mut self, yes: bool) {
+        self.enter_prints = yes;
+    }
+
+    /// Whether plain Enter prints the path (see [`set_enter_prints`](Self::set_enter_prints)).
+    pub fn enter_prints(&self) -> bool {
+        self.enter_prints
     }
 
     // --- accessors for the renderer ---
@@ -200,8 +223,44 @@ impl AppState {
             // path to stdout (what makes `vim $(ef)` work) moves to
             // Ctrl+Enter, since "I picked it, open it" is what a person
             // expects and shell composition is the specialist's path.
-            KeyCode::Enter if ctrl => self.selected_path().map(Action::Select),
+            //
+            // Unless stdout is captured, where printing the path *is* the obvious
+            // thing: the specialist's path is the one they are already on.
+            KeyCode::Enter if ctrl || self.enter_prints => self.selected_path().map(Action::Select),
             KeyCode::Enter => self.selected_path().map(Action::Open),
+            // Ctrl+J is Ctrl+Enter by another name. A line feed is what Ctrl+Enter turns into
+            // over SSH and in terminals that cannot tell it from Enter, and the console
+            // delivers that as Ctrl+Enter already; typed at a local terminal it arrives as
+            // the letter, and did nothing.
+            KeyCode::Char('j') if ctrl => self.selected_path().map(Action::Select),
+            // The two line-editing keys a shell user's hands already know. Starting over
+            // used to mean holding Backspace, at one search per character.
+            KeyCode::Char('u') if ctrl => {
+                if self.input.is_empty() {
+                    return None;
+                }
+                self.input.clear();
+                self.cursor = 0;
+                self.dispatch_current()
+            }
+            KeyCode::Char('w') if ctrl => {
+                // Back over the blanks before the cursor, then over the word before those. A
+                // word is a run of non-blanks: a query separates its terms with spaces, so
+                // this takes back one whole term, `path:C:\dir` as readily as `notes`.
+                let mut start = self.cursor;
+                while start > 0 && self.input[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                while start > 0 && !self.input[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                if start == self.cursor {
+                    return None;
+                }
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
+                self.dispatch_current()
+            }
             KeyCode::Up => {
                 self.move_selection_up(1);
                 None
@@ -469,6 +528,31 @@ mod tests {
         );
     }
 
+    /// With stdout captured (`vim $(ef)`), Enter hands over the path: that is what the
+    /// caller is waiting for. Opening is still there, on Ctrl+O.
+    #[test]
+    fn enter_prints_the_path_when_stdout_is_captured() {
+        let mut app = AppState::new("");
+        app.set_enter_prints(true);
+        app.on_key(ch('x')); // gen 1
+        app.on_response(1, search(&[("first", false), ("second", true)], 2), 1);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Select("second".into()))
+        );
+        assert_eq!(
+            app.on_key(ctrl(KeyCode::Enter)),
+            Some(Action::Select("second".into())),
+            "Ctrl+Enter prints either way"
+        );
+        assert_eq!(
+            app.on_key(ctrl(KeyCode::Char('o'))),
+            Some(Action::Open("second".into())),
+            "opening stays within reach"
+        );
+    }
+
     #[test]
     fn enter_on_empty_results_does_nothing() {
         let mut app = AppState::new("");
@@ -545,6 +629,77 @@ mod tests {
         assert_eq!(app.query(), "🔍検索𝕏a");
         assert_eq!(app.cursor(), 5); // 5 chars regardless of 4/3/3/4/1-byte encodings
         assert_eq!(app.query().chars().count(), app.cursor());
+    }
+
+    /// Ctrl+U empties the query in one key. Without it the way to start over was to hold
+    /// Backspace, with a search for every character on the way down.
+    #[test]
+    fn ctrl_u_clears_the_whole_line() {
+        let mut app = AppState::new("path:C:\\proj 見積書 2024");
+        app.dispatch_current(); // gen 1
+        app.on_response(1, search(&[("C:\\proj\\見積書 2024.xlsx", false)], 1), 1);
+        app.on_key(key(KeyCode::Left)); // wherever the cursor is, the whole line goes
+
+        // An empty query dispatches nothing: the list clears and the hint comes back.
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('u'))), None);
+        assert_eq!(app.query(), "");
+        assert_eq!(app.cursor(), 0);
+        assert!(app.results().is_empty());
+
+        // Typing afterwards starts a fresh query, and on an empty line the key does nothing.
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('u'))), None);
+        app.on_key(ch('a'));
+        assert_eq!(app.query(), "a");
+    }
+
+    /// Ctrl+W takes back one word: the run of non-blank characters before the cursor, with
+    /// any blanks between it and the cursor. A query's terms are separated by spaces, so a
+    /// "word" here is a whole term, operators and path included.
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let mut app = AppState::new("ext:rs path:dev\\grix 見積書");
+        let gen_before = app.req_gen;
+
+        // One search for the whole edit, not one per character removed.
+        assert!(matches!(
+            app.on_key(ctrl(KeyCode::Char('w'))),
+            Some(Action::Dispatch { gen, .. }) if gen == gen_before + 1
+        ));
+        assert_eq!(app.query(), "ext:rs path:dev\\grix ");
+        assert_eq!(app.cursor(), app.query().chars().count());
+
+        // The blanks after a word go with it; a term with `:` and `\` in it is one word.
+        app.on_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(app.query(), "ext:rs ");
+
+        // In the middle of the line, only what is before the cursor is taken.
+        let mut app = AppState::new("alpha beta gamma");
+        for _ in 0.."ta gamma".len() {
+            app.on_key(key(KeyCode::Left)); // cursor after "be"
+        }
+        app.on_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(app.query(), "alpha ta gamma");
+        assert_eq!(app.cursor(), "alpha ".len());
+
+        // At the start of the line there is nothing to take, and nothing is searched.
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('w'))), None);
+        assert_eq!(app.query(), "alpha ta gamma");
+    }
+
+    /// Ctrl+J prints the path, as Ctrl+Enter does. Over SSH and in terminals that cannot tell
+    /// Ctrl+Enter from Enter, a line feed is what a Ctrl+Enter becomes, and the console
+    /// already hands that to us as Ctrl+Enter; a Ctrl+J typed at a local terminal arrived as
+    /// the letter and did nothing. The same key should mean the same thing in both places.
+    #[test]
+    fn ctrl_j_prints_like_ctrl_enter() {
+        let mut app = AppState::new("");
+        app.on_key(ch('x')); // gen 1
+        app.on_response(1, search(&[("first", false), ("second", true)], 2), 1);
+        assert_eq!(
+            app.on_key(ctrl(KeyCode::Char('j'))),
+            Some(Action::Select("first".into()))
+        );
     }
 
     #[test]

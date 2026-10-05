@@ -62,6 +62,10 @@ type TuiTerminal = Terminal<CrosstermBackend<BufWriter<Stderr>>>;
 /// `Ok(Some(path))` when the user selects a row (the caller prints it to **stdout**), `Ok(None)`
 /// when the user aborts (Esc / Ctrl+C, nothing to stdout), or `Err` if the daemon is unreachable.
 ///
+/// `enter_prints` makes plain Enter select the row instead of opening it. The caller passes
+/// whether its stdout is captured, which this module does not look at: the screen it draws is
+/// on stderr (see [`AppState::set_enter_prints`]).
+///
 /// The terminal is set up on **stderr** and restored before returning, so the caller's stdout
 /// print lands on a clean terminal.
 pub fn run(
@@ -70,6 +74,7 @@ pub fn run(
     profile: bool,
     excludes_suffix: String,
     how: worker::SearchFlags,
+    enter_prints: bool,
 ) -> Result<Option<String>> {
     install_panic_hook();
     // Declare the guard BEFORE the terminal so that on an **unwind** the terminal (its `BufWriter`
@@ -87,6 +92,7 @@ pub fn run(
         &mut prof,
         excludes_suffix,
         how,
+        enter_prints,
     );
 
     // Normal path: the same order explicitly. Flush the terminal, then restore the screen (before
@@ -105,6 +111,7 @@ fn event_loop(
     prof: &mut Profiler,
     excludes_suffix: String,
     how: worker::SearchFlags,
+    enter_prints: bool,
 ) -> Result<Option<String>> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -140,6 +147,7 @@ fn event_loop(
     }
 
     let mut ui = Ui::new(initial_query);
+    ui.app.set_enter_prints(enter_prints);
     // Kick off the seeded search (if any) and an initial status fetch.
     if let Some(Action::Dispatch { gen, query }) = ui.app.dispatch_current() {
         ui.pending = Some((gen, Instant::now()));
@@ -483,6 +491,15 @@ mod tests {
     /// channel disconnects or an exit action fires. Returns (outcome, draw count, final ui,
     /// key->render sample count). A non-empty `seed` mirrors the real seeded-query kickoff.
     fn run_preloaded(msgs: Vec<Msg>, seed: &str) -> (Option<String>, u64, Ui, usize) {
+        run_preloaded_as(msgs, seed, false)
+    }
+
+    /// [`run_preloaded`], saying whether stdout is captured (`enter_prints`).
+    fn run_preloaded_as(
+        msgs: Vec<Msg>,
+        seed: &str,
+        enter_prints: bool,
+    ) -> (Option<String>, u64, Ui, usize) {
         let (tx, rx) = mpsc::channel::<Msg>();
         let (job_tx, _job_rx) = mpsc::channel::<Job>();
         for m in msgs {
@@ -491,6 +508,7 @@ mod tests {
         drop(tx); // after the batch, the next recv returns Disconnected -> Ok(None)
 
         let mut ui = Ui::new(seed);
+        ui.app.set_enter_prints(enter_prints);
         if !seed.is_empty() {
             if let Some(Action::Dispatch { gen, .. }) = ui.app.dispatch_current() {
                 ui.pending = Some((gen, Instant::now()));
@@ -573,5 +591,15 @@ mod tests {
         let msgs = vec![search_reply(1, r"C:\hit.txt"), key(KeyCode::Enter)];
         let (outcome, _draws, _ui, _samples) = run_preloaded(msgs, "kernel");
         assert_eq!(outcome, None, "plain Enter must not print a path");
+    }
+
+    #[test]
+    fn plain_enter_prints_the_path_when_stdout_is_captured() {
+        // `vim $(ef)`: the shell is waiting on stdout for a path, and Enter is the key a
+        // person presses to say "this one". Opening the file somewhere else and leaving the
+        // command substitution empty is what the README's own example used to do.
+        let msgs = vec![search_reply(1, r"C:\hit.txt"), key(KeyCode::Enter)];
+        let (outcome, _draws, _ui, _samples) = run_preloaded_as(msgs, "kernel", true);
+        assert_eq!(outcome, Some(r"C:\hit.txt".to_string()));
     }
 }

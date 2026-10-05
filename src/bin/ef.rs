@@ -8,6 +8,7 @@
 
 use everyfind::commas;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -41,20 +42,20 @@ enum Command {
     Service(ServiceCmd),
     /// Show the client config: the persistent excludes file and what it loads.
     Config,
-    /// Content search (grix engine): search *inside* files under the current
-    /// directory's tree. Runs entirely in this client; the daemon and the
-    /// name index are not involved.
+    /// Search inside files (regex) under the current directory's tree.
+    // The grix engine, running entirely in this client: the daemon and the name index are
+    // not involved.
     #[command(visible_alias = "c")]
     Content(ContentArgs),
-    /// Add/remove "Search here with Everyfind" in the folder right-click menu
-    /// (per-user, no Administrator needed). Opens this CLI's TUI scoped to the
-    /// folder; nothing is loaded into Explorer, and it is not part of the
-    /// search-box integration below.
+    /// Add or remove "Search here with Everyfind" in the folder right-click menu
+    /// (per-user; no Administrator needed).
+    // It opens this CLI's TUI scoped to the folder. Nothing is loaded into Explorer, and it
+    // is not part of the search-box integration below.
     #[command(subcommand)]
     Shell(ShellCmd),
-    /// Put Everyfind behind **Explorer's own search box** by replacing the engine
-    /// underneath it. The breadcrumb, the view and the box stay native; only the
-    /// rows come from here.
+    /// Answer Explorer's own search box from the Everyfind index (per-user, reversible).
+    // Done by replacing the engine underneath the box: the breadcrumb, the view and the box
+    // itself stay native, and only the rows come from here.
     #[command(subcommand)]
     Explorer(ExplorerCmd),
     /// (plumbing) Build/refresh the content index for a root, spawned
@@ -97,23 +98,20 @@ struct DuArgs {
     #[arg(long)]
     bytes: bool,
 
-    /// Connect/response timeout, milliseconds.
-    ///
-    /// It bounds the whole round trip now, which it did not before: only the connect was
-    /// bounded, and the connect never blocks. Ten seconds because the deadline is real: a
-    /// whole-volume term on a six-million-entry index takes about three seconds of honest
-    /// work, and two would have failed it. This is how long to wait for an answer, not how
-    /// long an answer should take.
+    /// How long to wait for the daemon's answer, in milliseconds.
+    // See `SearchArgs::timeout_ms` for why it is ten seconds.
     #[arg(long, default_value_t = 10_000)]
     timeout_ms: u64,
 }
 
 #[derive(Debug, Subcommand)]
 enum ExplorerCmd {
-    /// Replace the **engine** behind Explorer's own search box: results become
-    /// Everyfind's while the breadcrumb, view, and box stay completely native.
-    /// Shadows the search data-source CLSID under HKCU (per-user, reversible, no
-    /// injection; it applies to every Explorer process automatically).
+    /// Install, remove or inspect the search-box integration (per-user registry keys;
+    /// nothing is injected into Explorer).
+    // It replaces the engine behind Explorer's own search box: results become Everyfind's
+    // while the breadcrumb, view, and box stay completely native. Done by shadowing the
+    // search data-source CLSID under HKCU, which applies to every Explorer process
+    // automatically.
     #[command(subcommand)]
     Engine(EngineCmd),
 }
@@ -130,13 +128,12 @@ enum EngineCmd {
         /// Turn on the provider's diagnostic log at %TEMP%\searchshim.log.
         #[arg(long)]
         debug: bool,
-        /// Leave Windows Search's crawl scope alone. Without this, the volume the
-        /// daemon serves is marked as indexed so *every* folder on it answers with
-        /// Everyfind, which does not make Windows index anything, it only decides
-        /// which engine Explorer asks. Skip it and folders outside the existing
-        /// scope (the drive root, C:\Windows) keep answering with Windows' own
-        /// results. Other drives are never marked: Everyfind indexes one volume,
-        /// and Explorer must go on walking the ones it cannot answer for.
+        /// Leave Windows Search's crawl scope alone. Folders outside the existing scope
+        /// (the drive root, C:\Windows) then keep answering with Windows' own results.
+        // Without this, the volume the daemon serves is marked as indexed so *every* folder
+        // on it answers with Everyfind, which does not make Windows index anything, it only
+        // decides which engine Explorer asks. Other drives are never marked: Everyfind
+        // indexes one volume, and Explorer must go on walking the ones it cannot answer for.
         #[arg(long)]
         no_scope: bool,
     },
@@ -162,7 +159,7 @@ enum ServiceCmd {
         /// Target NTFS volume to index.
         #[arg(long, default_value = "C:")]
         volume: String,
-        /// Pipe access mode: `interactive` (default) or `admins`.
+        /// Who may search: `interactive` (anyone logged on at this machine) or `admins`.
         #[arg(long, default_value = "interactive")]
         acl: String,
     },
@@ -176,13 +173,14 @@ enum ServiceCmd {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
-    /// Substring to search for in file names.
-    query: Option<String>,
+    /// What to search for in file names. Several words are one query: `ef report 2024`
+    /// finds names containing both. Without a query, `ef` opens the interactive screen.
+    query: Vec<String>,
 
-    /// Scope the search to a folder: seeds the query with a `path:` term.
-    /// This is what the Explorer context menu passes; handy standalone too
-    /// (`ef --in C:\proj` opens the TUI already narrowed to that tree).
-    /// A volume root (`C:\`) seeds nothing; it would match everything.
+    /// Search only under this folder (`ef --in C:\proj` opens the interactive screen
+    /// already narrowed to that tree).
+    // It seeds the query with a `path:` term, and is what the Explorer context menu passes.
+    // A volume root (`C:\`) seeds nothing; it would match everything.
     #[arg(long = "in", value_name = "DIR")]
     in_dir: Option<std::path::PathBuf>,
 
@@ -194,16 +192,17 @@ struct SearchArgs {
     #[arg(short = 'a', long = "all")]
     include_orphans: bool,
 
-    /// Maximum number of paths to print (one-shot mode).
-    #[arg(short = 'n', long, default_value_t = 20)]
-    limit: u32,
+    /// Maximum number of paths to print (one-shot mode). Default: 20 at a terminal; when
+    /// the output is piped or redirected, everything the daemon returns (up to 100,000).
+    #[arg(short = 'n', long)]
+    limit: Option<u32>,
 
-    /// Launch the interactive TUI, seeded with the query if given. A bare `ef` on a terminal
-    /// also opens the TUI; `ef <query>` (without `-i`) stays a one-shot print.
+    /// Open the interactive screen, starting from the query if one is given.
+    // A bare `ef` on a terminal opens it too; `ef <query>` without `-i` stays a one-shot print.
     #[arg(short = 'i', long)]
     interactive: bool,
 
-    /// (TUI) print key->render latency percentiles to stderr on exit.
+    /// (interactive screen) Print key-to-render latency percentiles to stderr on exit.
     #[arg(long)]
     profile: bool,
 
@@ -211,13 +210,12 @@ struct SearchArgs {
     #[arg(long)]
     no_excludes: bool,
 
-    /// Connect/response timeout, milliseconds.
-    ///
-    /// It bounds the whole round trip now, which it did not before: only the connect was
-    /// bounded, and the connect never blocks. Ten seconds because the deadline is real: a
-    /// whole-volume term on a six-million-entry index takes about three seconds of honest
-    /// work, and two would have failed it. This is how long to wait for an answer, not how
-    /// long an answer should take.
+    /// How long to wait for the daemon's answer, in milliseconds.
+    // It bounds the whole round trip, which it once did not: only the connect was bounded,
+    // and the connect never blocks. Ten seconds because the deadline is real: a whole-volume
+    // term on a six-million-entry index takes about three seconds of honest work, and two
+    // would have failed it. This is how long to wait for an answer, not how long an answer
+    // should take.
     #[arg(long, default_value_t = 10_000)]
     timeout_ms: u64,
 }
@@ -618,6 +616,31 @@ fn drive_letter(p: &std::path::Path) -> Option<char> {
     }
 }
 
+/// A path argument, made absolute if it is relative.
+///
+/// A relative path means "from here", and only this process knows where here is: the daemon
+/// was started by the service manager and has no current directory worth the name. Sent as
+/// typed, `ef du .` was "path not found in the index", `ef du release` looked for a folder
+/// called `release` at the volume root, and `ef --in .` became the term `path:.`, which
+/// matches nearly every path on the volume and reads as "the scope did nothing".
+///
+/// Only a path with no drive letter is touched. Everything that names one goes through
+/// exactly as it arrived, and that is deliberate: `--in` receives `C:"` (what Explorer's
+/// `--in "%V"` turns into for a drive root) and a bare `C:`, both of which [`seed_query`]
+/// knows to read as the root. To the path API those are "the current directory on C:", so
+/// resolving them here would turn a right-click on `C:\` into a search of wherever this
+/// process happens to be. UNC paths are absolute already.
+fn absolute_arg(p: &Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    let names_a_drive = matches!(s.as_bytes(), [c, b':', ..] if c.is_ascii_alphabetic());
+    if s.is_empty() || names_a_drive || s.starts_with(r"\\") || s.starts_with("//") {
+        return p.to_path_buf();
+    }
+    // Lexical (`GetFullPathNameW`): it does not need the path to exist, and it does not
+    // follow links, so what the user named is what the index is asked about.
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Ask the daemon which drive it indexes. Best-effort: on any error (daemon not
 /// running, timeout) return `None` so the caller skips the check rather than
 /// blocking a search behind a status round trip.
@@ -628,41 +651,70 @@ fn indexed_drive(timeout: Duration) -> Option<char> {
     }
 }
 
+/// If `path` is on a drive the daemon does not index: the drive asked for, and the one that
+/// is indexed. `None` when the path is on the indexed drive, names no drive, or the daemon
+/// could not be asked (the request that follows will say so itself).
+///
+/// The index covers exactly one volume. A folder on another drive (a second disk, a network
+/// mapping, a mounted image) is simply not in it, and an answer that does not say so reads
+/// as broken: an empty search, or worse, somebody else's numbers.
+fn other_drive(path: &Path, timeout: Duration) -> Option<(char, char)> {
+    let asked = drive_letter(path)?;
+    let indexed = indexed_drive(timeout)?;
+    (!asked.eq_ignore_ascii_case(&indexed)).then_some((asked.to_ascii_uppercase(), indexed))
+}
+
+/// The query as typed on the command line, or `None` if none was.
+///
+/// A shell splits what is typed at spaces, so the arguments are put back together with one:
+/// `ef report 2024` and `ef "report 2024"` are the same query. An argument is joined as it
+/// arrived, with nothing added around it, which is what lets a whole query be handed over in
+/// one quoted piece when it contains something the shell would otherwise act on
+/// (`ef 'cargo.toml | package.json'`).
+///
+/// `None` is "no query", which opens the TUI; `Some("")` is the empty query of `ef ""`, which
+/// lists everything. They are different requests and have to stay distinguishable.
+fn typed_query(args: &SearchArgs) -> Option<String> {
+    (!args.query.is_empty()).then(|| args.query.join(" "))
+}
+
 fn run_default(args: &SearchArgs, timeout: Duration) -> ExitCode {
     // `--in DIR` (the Explorer right-click entry) scopes to a folder. The index
     // covers exactly one volume; a folder on a *different* drive (a second
     // disk, a network mapping, a VeraCrypt/mounted volume) is simply not in it,
     // so a scoped search would silently return nothing. Detect that up front and
     // say why, instead of showing an empty result that reads as broken.
-    if let Some(dir) = &args.in_dir {
-        if let Some(indexed) = indexed_drive(timeout) {
-            if let Some(d) = drive_letter(dir) {
-                if !d.eq_ignore_ascii_case(&indexed) {
-                    eprintln!(
-                        "ef: {d}:\\ is not indexed; Everyfind indexes only {indexed}:\\ \
+    //
+    // A relative `DIR` is resolved first (`ef --in .`), so that this check and the seed below
+    // both see the folder that was meant. It happens here, ahead of `seed_query`, and leaves
+    // every shape `seed_query` has a rule for exactly as it arrived (see `absolute_arg`).
+    let in_dir = args.in_dir.as_deref().map(absolute_arg);
+    if let Some(dir) = &in_dir {
+        if let Some((d, indexed)) = other_drive(dir, timeout) {
+            eprintln!(
+                "ef: {d}:\\ is not indexed; Everyfind indexes only {indexed}:\\ \
 (one volume per daemon). Nothing to search here."
-                    );
-                    // Launched from Explorer's right-click a fresh console opens
-                    // and would vanish the instant we exit; keep it up so the
-                    // message is readable. Skipped when output is redirected.
-                    if std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
-                        eprint!("Press Enter to close...");
-                        let mut s = String::new();
-                        let _ = std::io::stdin().read_line(&mut s);
-                    }
-                    return ExitCode::from(2);
-                }
+            );
+            // Launched from Explorer's right-click a fresh console opens
+            // and would vanish the instant we exit; keep it up so the
+            // message is readable. Skipped when output is redirected.
+            if std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
+                eprint!("Press Enter to close...");
+                let mut s = String::new();
+                let _ = std::io::stdin().read_line(&mut s);
             }
+            return ExitCode::from(2);
         }
     }
 
-    let seeded: Option<String> = match (&args.in_dir, &args.query) {
+    let typed = typed_query(args);
+    let seeded: Option<String> = match (&in_dir, &typed) {
         (Some(dir), q) => Some(seed_query(&dir.to_string_lossy(), q.as_deref())),
         (None, q) => q.clone(),
     };
-    let want_tui = args.interactive || args.query.is_none();
+    let want_tui = args.interactive || typed.is_none();
     if !want_tui {
-        return finish(run_search(seeded.as_deref().unwrap_or(""), args, timeout));
+        return finish_search(run_search(seeded.as_deref().unwrap_or(""), args, timeout));
     }
     // The TUI needs a real terminal for both input (stdin) and its stderr rendering; stdout may
     // be redirected (that is what makes `vim $(ef)` work).
@@ -688,8 +740,14 @@ fn run_default(args: &SearchArgs, timeout: Duration) -> ExitCode {
     )
 }
 
-/// Drive the TUI. On Enter it returns the selected path, which we print to **stdout** (the only
-/// stdout output; the TUI itself draws to stderr, so command substitution captures a clean path).
+/// Drive the TUI. When a row is selected it returns that path, which we print to **stdout** (the
+/// only stdout output; the TUI itself draws to stderr, so command substitution captures a clean
+/// path).
+///
+/// What selects a row depends on where that stdout goes. Captured (`vim $(ef)`, `$dir = ef`),
+/// plain Enter does: a path is what the caller is waiting for. At a terminal Enter opens the
+/// file and Ctrl+Enter is what selects. The test is on stdout because that is the stream being
+/// asked about; stdin and stderr are a terminal either way, or the TUI would not be running.
 fn run_tui(
     initial: &str,
     timeout: Duration,
@@ -697,7 +755,8 @@ fn run_tui(
     excludes: String,
     how: everyfind::tui::worker::SearchFlags,
 ) -> ExitCode {
-    match tui::run(initial, timeout, profile, excludes, how) {
+    let enter_prints = !std::io::stdout().is_terminal();
+    match tui::run(initial, timeout, profile, excludes, how, enter_prints) {
         Ok(Some(path)) => {
             println!("{path}");
             ExitCode::SUCCESS
@@ -726,15 +785,33 @@ fn reported() -> ClientError {
 fn finish(result: Result<(), ClientError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(ClientError::NotRunning(_)) => {
-            eprintln!("Everyfind daemon (efd) is not running.");
-            ExitCode::FAILURE
-        }
-        Err(ClientError::Io(e)) if e.to_string() == ALREADY_REPORTED => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("ef: {e}");
+            report(e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The exit code of a one-shot search: 0 if something matched, 1 if nothing did, 2 if the
+/// search could not be run. The convention of `grep` and ripgrep, and what `ef content`
+/// already did, so that `if ef x; then` can tell "not found" from "could not look".
+fn finish_search(result: Result<bool, ClientError>) -> ExitCode {
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            report(e);
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Say why a request failed, unless whoever failed it already has.
+fn report(e: ClientError) {
+    match e {
+        ClientError::NotRunning(_) => eprintln!("Everyfind daemon (efd) is not running."),
+        ClientError::Io(e) if e.to_string() == ALREADY_REPORTED => {}
+        e => eprintln!("ef: {e}"),
     }
 }
 
@@ -768,7 +845,19 @@ fn run_service_cmd(cmd: &ServiceCmd) -> ExitCode {
     }
 }
 
-fn run_search(query: &str, args: &SearchArgs, timeout: Duration) -> Result<(), ClientError> {
+/// Run a one-shot search and list what it found. `Ok(true)` if anything matched.
+fn run_search(query: &str, args: &SearchArgs, timeout: Duration) -> Result<bool, ClientError> {
+    let how = if std::io::stdout().is_terminal() {
+        Listing::Terminal
+    } else {
+        Listing::Piped
+    };
+    // A person wants a screenful. A program wants the answer, and the first twenty of four
+    // hundred is not it: with no `-n`, a pipe gets as much as the daemon will return.
+    let limit = args.limit.unwrap_or(match how {
+        Listing::Terminal => TERMINAL_LIMIT,
+        Listing::Piped => everyfind::ipc::MAX_SEARCH_LIMIT,
+    });
     // Persistent excludes ride along as `!path:` terms; the display below keeps
     // showing only what the user typed (`--in` scoping included, so a scoped
     // zero-hit report names its scope).
@@ -776,7 +865,7 @@ fn run_search(query: &str, args: &SearchArgs, timeout: Duration) -> Result<(), C
         query: config::compose(query, &excludes_suffix(args.no_excludes)),
         case_sensitive: args.case_sensitive,
         include_orphans: args.include_orphans,
-        limit: args.limit,
+        limit,
         // Pure rank order on a terminal: raising -n shows the rest.
         reserve_elsewhere: 0,
     };
@@ -790,10 +879,23 @@ fn run_search(query: &str, args: &SearchArgs, timeout: Duration) -> Result<(), C
                 eprintln!(
                     "ef: the index is still building (first start after boot). Try again in a moment. `ef status` shows progress."
                 );
-                return Err(ClientError::Io(std::io::Error::other("building")));
+                return Err(reported());
             }
-            print_search(query, total_hits, &results, args.limit);
-            Ok(())
+            // Buffered, and through `writeln!` rather than `println!`: a hundred thousand
+            // paths are a hundred thousand writes otherwise, and `println!` panics when the
+            // reader has gone away, which is what `ef x | head -1` does to it by design.
+            let stdout = std::io::stdout();
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            let written = write_search(&mut out, how, query, total_hits, &results, limit)
+                .and_then(|note| std::io::Write::flush(&mut out).map(|()| note));
+            match written {
+                Ok(Some(note)) => eprintln!("{note}"),
+                Ok(None) => {}
+                // The reader closed the pipe: it has what it wanted, and that is not an error.
+                Err(e) if reader_went_away(&e) => {}
+                Err(e) => return Err(ClientError::Io(e)),
+            }
+            Ok(total_hits > 0)
         }
         Response::Error { code, message } => {
             eprintln!("ef: daemon error ({code:?}): {message}");
@@ -801,34 +903,110 @@ fn run_search(query: &str, args: &SearchArgs, timeout: Duration) -> Result<(), C
         }
         Response::Status(_) | Response::Du { .. } => {
             eprintln!("ef: unexpected response to a search");
-            Err(ClientError::Io(std::io::Error::other("protocol")))
+            Err(reported())
         }
     }
 }
 
-fn print_search(query: &str, total_hits: u64, results: &[SearchHit], limit: u32) {
-    if total_hits == 0 {
-        println!("no matches for {query:?}");
-        return;
-    }
-    println!("{} match(es) for {query:?}:", commas(total_hits));
-    // One-shot output stays path-only (human-facing, unchanged from M3); `is_dir` is a TUI
-    // affordance.
-    for hit in results {
-        println!("  {}", hit.path);
-    }
+/// Whether a write to stdout failed because whatever was reading it stopped reading.
+///
+/// On Windows that arrives as `ERROR_NO_DATA` (232, "the pipe is being closed") from a pipe
+/// whose reader has exited, and as `ERROR_BROKEN_PIPE` (109) in other arrangements. Both are
+/// checked by number as well as by kind, so this does not depend on how a given standard
+/// library chooses to classify them.
+fn reader_went_away(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe || matches!(e.raw_os_error(), Some(109 | 232))
+}
+
+/// Who is reading a one-shot search's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// A person, at a terminal.
+    Terminal,
+    /// Another program: a pipe, a file, a command substitution.
+    Piped,
+}
+
+/// How many paths a one-shot search prints at a terminal when `-n` is not given: a screenful.
+const TERMINAL_LIMIT: u32 = 20;
+
+/// Write a one-shot search's answer to `out`. Returns a line for stderr when there is
+/// something to say that does not belong among the paths.
+///
+/// Two listings, because the two readers want different things. A person gets the count, the
+/// paths set off by an indent, and how many more there are. A program gets the paths, one to a
+/// line and nothing else: anything more is a "path" to whatever reads the pipe, which is how
+/// `ef x | xargs ...` came to open a file called `418 match(es) for "x":`. `is_dir` is not
+/// printed in either; it is a TUI affordance.
+fn write_search(
+    out: &mut impl std::io::Write,
+    how: Listing,
+    query: &str,
+    total_hits: u64,
+    results: &[SearchHit],
+    limit: u32,
+) -> std::io::Result<Option<String>> {
     let shown = results.len() as u64;
-    if total_hits > shown {
-        println!(
+    // The daemon clamps `limit`, so past its ceiling "raise -n" is advice that cannot work.
+    let capped = total_hits > shown && limit >= everyfind::ipc::MAX_SEARCH_LIMIT;
+    let cap = commas(u64::from(everyfind::ipc::MAX_SEARCH_LIMIT));
+
+    if how == Listing::Piped {
+        for hit in results {
+            writeln!(out, "{}", hit.path)?;
+        }
+        // Fewer than asked for is `-n` doing what it was told. Fewer than there are, with
+        // nothing asked, is the one thing a pipeline cannot see for itself.
+        return Ok(capped.then(|| {
+            format!(
+                "ef: {} more matches not listed (the daemon returns at most {cap} per query)",
+                commas(total_hits - shown)
+            )
+        }));
+    }
+
+    if total_hits == 0 {
+        writeln!(out, "no matches for {query:?}")?;
+        return Ok(None);
+    }
+    writeln!(out, "{} match(es) for {query:?}:", commas(total_hits))?;
+    for hit in results {
+        writeln!(out, "  {}", hit.path)?;
+    }
+    if capped {
+        writeln!(
+            out,
+            "  ... and {} more (the daemon returns at most {cap} per query)",
+            commas(total_hits - shown)
+        )?;
+    } else if total_hits > shown {
+        writeln!(
+            out,
             "  ... and {} more (raise -n, currently {limit})",
             commas(total_hits - shown)
-        );
+        )?;
     }
+    Ok(None)
 }
 
 fn run_du(a: &DuArgs) -> Result<(), ClientError> {
     let timeout = Duration::from_millis(a.timeout_ms);
-    let path = a.path.clone().unwrap_or_default(); // "" -> the daemon resolves to the volume root
+    // No path -> "", which the daemon resolves to the volume root. A relative one is resolved
+    // here, against this process's directory: `ef du .` is the folder you are standing in.
+    let path = match &a.path {
+        Some(p) => absolute_arg(Path::new(p)).to_string_lossy().into_owned(),
+        None => String::new(),
+    };
+    // The daemon refuses a path on a drive it does not index, but only a daemon new enough to
+    // look: an older one drops the letter and answers with its own volume's root. Asking
+    // first costs one status round trip and is right against either.
+    if let Some((d, indexed)) = other_drive(Path::new(&path), timeout) {
+        eprintln!(
+            "ef du: {d}:\\ is not indexed; Everyfind indexes only {indexed}:\\ \
+(one volume per daemon)."
+        );
+        return Err(reported());
+    }
     let req = Request::Du {
         path: path.clone(),
         depth: a.depth,
@@ -885,23 +1063,8 @@ fn print_du(
     if truncated {
         println!("  warning: some files exceed the 16 TiB size cap; totals are a lower bound");
     }
-    // A total is only worth printing if the sizes behind it were actually read. The size pass
-    // is fail-soft, so when it yields little or nothing `du` would otherwise add up whatever
-    // the journal has since filled in and present it with the same confidence as a complete
-    // answer. Measured on a live volume in exactly that state: 47.0 GiB printed against
-    // 827.6 GB actually used. Saying so is the difference between a partial answer and a
-    // wrong one.
-    if entries > 0 && sizes_resolved * 10 < entries * 9 {
-        let pct = 100.0 * sizes_resolved as f64 / entries as f64;
-        println!(
-            "  warning: only {} of {} entries have a size ({:.0}%); this total is far short of the real one.",
-            commas(sizes_resolved),
-            commas(entries),
-            pct
-        );
-        println!(
-            "     The size pass did not complete; `efd`'s log says why. A restart re-runs it."
-        );
+    for line in size_shortfall_warning(sizes_resolved, entries, &service::data_dir()) {
+        println!("{line}");
     }
     println!("  total: {}", fmt_size(total_bytes, bytes));
     for r in rows {
@@ -919,6 +1082,53 @@ fn print_du(
             r.path,
         );
     }
+}
+
+/// What `ef du` says when too many files have no size for its total to be trusted, as the
+/// lines to print; nothing when the total stands.
+///
+/// A total is only worth printing if the sizes behind it were actually read. The size pass is
+/// fail-soft, so when it yields little or nothing `du` would otherwise add up whatever the
+/// journal has since filled in and present it with the same confidence as a complete answer.
+/// Measured on a live volume in exactly that state: 47.0 GiB printed against 827.6 GB actually
+/// used. Saying so is the difference between a partial answer and a wrong one.
+///
+/// `sizes_resolved` and `entries` are both counts of live entries, so what separates them is
+/// the files nobody has measured. The advice has to be advice that works: this used to end
+/// "A restart re-runs it", and a restart resumes the snapshot, sizes and gaps alike, unless
+/// more than half of the files are missing (`Watched::from_snapshot`). What does re-read
+/// every size is a build from nothing, and deleting the snapshot is how to ask for one.
+fn size_shortfall_warning(sizes_resolved: u64, entries: u64, data_dir: &Path) -> Vec<String> {
+    if entries == 0 || sizes_resolved * 10 >= entries * 9 {
+        return Vec::new();
+    }
+    let missing = entries.saturating_sub(sizes_resolved);
+    vec![
+        format!(
+            "  warning: {} files have no size ({:.0}% of {} live entries) and count as 0; \
+             this total is short of the real one.",
+            commas(missing),
+            100.0 * missing as f64 / entries as f64,
+            commas(entries),
+        ),
+        "     Sizes are read when the index is built and again as files change. A restart resumes"
+            .to_string(),
+        "     the snapshot as it is: sizes are re-read only when more than half are missing."
+            .to_string(),
+        "     To re-read them all, rebuild the index from an Administrator terminal:".to_string(),
+        "         ef service stop".to_string(),
+        format!(
+            "         del \"{}\"",
+            data_dir.join("index.snapshot").display()
+        ),
+        "         ef service start".to_string(),
+        format!(
+            "     The daemon's log may say why they are missing: {}",
+            data_dir.join("efd.log").display()
+        ),
+        "     (readable by Administrators only; a foreground efd logs to its console instead)."
+            .to_string(),
+    ]
 }
 
 /// Human-readable (or raw, when `raw`) byte size.
@@ -1000,10 +1210,11 @@ fn print_status(s: &StatusReport) {
         commas(s.entries),
         commas(s.live_entries)
     );
+    // Against the live entries: a deleted file is not one whose size is missing.
     println!(
-        "  sizes (du)        : {} / {} resolved",
+        "  sizes (du)        : {} / {} live entries resolved",
         commas(s.sizes_resolved),
-        commas(s.entries)
+        commas(s.live_entries)
     );
     println!(
         "  journal lag       : {} USN (synced {}s ago)",
@@ -1045,6 +1256,186 @@ fn human_secs(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hits(paths: &[&str]) -> Vec<SearchHit> {
+        paths
+            .iter()
+            .map(|p| SearchHit {
+                path: (*p).to_string(),
+                is_dir: false,
+            })
+            .collect()
+    }
+
+    /// What `write_search` puts on stdout, and what it hands back for stderr.
+    fn listed(
+        how: Listing,
+        query: &str,
+        total: u64,
+        results: &[SearchHit],
+        limit: u32,
+    ) -> (String, Option<String>) {
+        let mut out = Vec::new();
+        let note = write_search(&mut out, how, query, total, results, limit).expect("write");
+        (String::from_utf8(out).expect("utf-8"), note)
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("ef").chain(args.iter().copied()))
+    }
+
+    /// Words typed at a shell are one query, with a space between them: `ef report 2024` is
+    /// the README's first example of an AND, and a shell hands it over as two arguments.
+    ///
+    /// It was refused. The query was a single argument, so the second word was read as a
+    /// subcommand that did not exist: "the subcommand '2024' cannot be used with '[QUERY]'".
+    #[test]
+    fn several_arguments_are_one_query() {
+        let cli = parse(&["report", "2024"]).expect("two words are a query");
+        assert!(cli.command.is_none());
+        assert_eq!(typed_query(&cli.search).as_deref(), Some("report 2024"));
+
+        let cli = parse(&["log", "!cache", "!ext:tmp;bak"]).expect("operators are words too");
+        assert_eq!(
+            typed_query(&cli.search).as_deref(),
+            Some("log !cache !ext:tmp;bak")
+        );
+
+        // Options keep working wherever they fall among the words.
+        let cli = parse(&["report", "-n", "5", "2024", "-s"]).expect("options among the words");
+        assert_eq!(typed_query(&cli.search).as_deref(), Some("report 2024"));
+        assert_eq!(cli.search.limit, Some(5));
+        assert!(cli.search.case_sensitive);
+    }
+
+    /// An argument that was quoted for the shell arrives whole and is joined as it is, so a
+    /// query written as one quoted string means exactly what it says.
+    #[test]
+    fn a_single_quoted_argument_is_the_query_verbatim() {
+        let cli = parse(&["cargo.toml | package.json"]).expect("one argument");
+        assert_eq!(
+            typed_query(&cli.search).as_deref(),
+            Some("cargo.toml | package.json")
+        );
+        let cli = parse(&["\"annual report\""]).expect("a phrase");
+        assert_eq!(
+            typed_query(&cli.search).as_deref(),
+            Some("\"annual report\"")
+        );
+    }
+
+    /// No query at all is how the TUI is asked for, and has to stay distinguishable from an
+    /// empty one (`ef ""` lists everything).
+    #[test]
+    fn no_query_is_not_an_empty_query() {
+        let cli = parse(&[]).expect("bare ef");
+        assert_eq!(typed_query(&cli.search), None);
+        let cli = parse(&["-n", "5"]).expect("options only");
+        assert_eq!(typed_query(&cli.search), None);
+        let cli = parse(&[""]).expect("an explicit empty query");
+        assert_eq!(typed_query(&cli.search).as_deref(), Some(""));
+    }
+
+    /// A first word that names a subcommand is that subcommand; after `--` it is a word.
+    #[test]
+    fn a_subcommand_name_is_searched_for_after_a_double_dash() {
+        let cli = parse(&["status"]).expect("the subcommand");
+        assert!(matches!(cli.command, Some(Command::Status)));
+
+        let cli = parse(&["--", "status"]).expect("the word");
+        assert!(cli.command.is_none());
+        assert_eq!(typed_query(&cli.search).as_deref(), Some("status"));
+
+        let cli = parse(&["-n", "2", "--", "status", "report"]).expect("words after --");
+        assert_eq!(typed_query(&cli.search).as_deref(), Some("status report"));
+    }
+
+    /// A program reading the output gets paths and nothing else: one per line, exactly as
+    /// they are, so that `ef x | xargs ...` and `$(ef x)` work on what comes out.
+    ///
+    /// They did not. The count, the two-space indent and the "... and N more" line all went
+    /// to stdout whoever was reading, so the first "path" a pipeline received was
+    /// `418 match(es) for "cargo.toml":` and every real one began with two spaces.
+    #[test]
+    fn piped_output_is_paths_only() {
+        let results = hits(&[r"C:\a\Cargo.toml", r"C:\b c\Cargo.toml"]);
+        let (out, note) = listed(Listing::Piped, "cargo.toml", 418, &results, 2);
+        assert_eq!(out, "C:\\a\\Cargo.toml\nC:\\b c\\Cargo.toml\n");
+        assert_eq!(note, None, "`-n 2` asked for two; there is nothing to add");
+    }
+
+    /// No matches, piped: nothing at all on stdout. The exit code carries it.
+    #[test]
+    fn piped_output_is_empty_when_nothing_matches() {
+        let (out, note) = listed(Listing::Piped, "zzz", 0, &[], 20);
+        assert_eq!(out, "");
+        assert_eq!(note, None);
+    }
+
+    /// The one thing a pipeline cannot see for itself is that the daemon stopped short of
+    /// everything. That goes to stderr, where it reaches a person and not the next program.
+    #[test]
+    fn piped_output_says_on_stderr_when_the_daemon_cap_cut_it_short() {
+        let results = hits(&[r"C:\a", r"C:\b"]);
+        let cap = everyfind::ipc::MAX_SEARCH_LIMIT;
+        let (out, note) = listed(Listing::Piped, "a", 5_000_000, &results, cap);
+        assert_eq!(out, "C:\\a\nC:\\b\n");
+        let note = note.expect("a truncated listing is said out loud");
+        assert!(
+            note.contains("4,999,998") && note.contains("100,000"),
+            "{note}"
+        );
+    }
+
+    /// At a terminal the listing is for a person, and stays as it was.
+    #[test]
+    fn terminal_output_keeps_its_heading_indent_and_remainder() {
+        let results = hits(&[r"C:\a\Cargo.toml", r"C:\b\Cargo.toml"]);
+        let (out, note) = listed(Listing::Terminal, "cargo.toml", 418, &results, 2);
+        assert_eq!(
+            out,
+            "418 match(es) for \"cargo.toml\":\n  C:\\a\\Cargo.toml\n  C:\\b\\Cargo.toml\n  \
+             ... and 416 more (raise -n, currently 2)\n"
+        );
+        assert_eq!(note, None);
+
+        let (out, _) = listed(Listing::Terminal, "zzz", 0, &[], 20);
+        assert_eq!(out, "no matches for \"zzz\"\n");
+    }
+
+    /// The `du` warning is for a total that is missing a real share of its sizes, and it has
+    /// to say something a reader can act on: how much is missing, how to get it back, and
+    /// where the reason is written down.
+    #[test]
+    fn the_du_warning_fires_under_ninety_percent_and_says_what_to_do() {
+        let dir = Path::new(r"C:\ProgramData\everyfind");
+        assert!(
+            size_shortfall_warning(900, 1_000, dir).is_empty(),
+            "nine in ten is not a shortfall worth a warning"
+        );
+        assert!(
+            size_shortfall_warning(0, 0, dir).is_empty(),
+            "an empty index"
+        );
+
+        let text = size_shortfall_warning(899, 1_000, dir).join("\n");
+        assert!(
+            text.contains("101 files have no size (10% of 1,000 live entries)"),
+            "how much is missing: {text}"
+        );
+        assert!(
+            text.contains(r#"del "C:\ProgramData\everyfind\index.snapshot""#),
+            "how to get it back: {text}"
+        );
+        assert!(
+            text.contains(r"C:\ProgramData\everyfind\efd.log") && text.contains("Administrators"),
+            "where the reason is, and who can read it: {text}"
+        );
+        assert!(
+            !text.contains("A restart re-runs it"),
+            "a restart resumes the snapshot; it does not re-read sizes: {text}"
+        );
+    }
 
     /// The terminal form groups by file, right-aligns the numbers within one,
     /// and separates files with a blank line; color wraps only the heading,
@@ -1124,6 +1515,62 @@ mod tests {
         let parsed = everyfind::index::query::parse(&seed);
         assert_eq!(parsed.paths, vec![r"C:\Program Files\App".to_string()]);
         assert_eq!(parsed.words, vec!["readme".to_string()]);
+    }
+
+    /// A relative path means "from here", so it is made absolute before it goes anywhere.
+    /// The daemon has no "here": `ef du .` was "path not found in the index", and
+    /// `ef --in .` became the term `path:.`, which matches nearly every path there is.
+    #[test]
+    fn a_relative_path_is_resolved_against_the_current_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(absolute_arg(Path::new(".")), cwd);
+        assert_eq!(absolute_arg(Path::new("release")), cwd.join("release"));
+        assert_eq!(
+            absolute_arg(Path::new(r"sub\dir")),
+            cwd.join("sub").join("dir")
+        );
+        assert_eq!(
+            absolute_arg(Path::new("./sub/dir")),
+            cwd.join("sub").join("dir")
+        );
+        assert_eq!(absolute_arg(Path::new("..")), cwd.parent().expect("parent"));
+        // No drive letter, but anchored at a root: the current drive's.
+        let drive = &cwd.to_string_lossy()[..2];
+        assert_eq!(
+            absolute_arg(Path::new(r"\Users")),
+            Path::new(&format!(r"{drive}\Users"))
+        );
+    }
+
+    /// Anything that already names a drive is left exactly as it arrived. That includes the
+    /// shapes `seed_query` exists to cope with (`C:"`, which is what Explorer's `--in "%V"`
+    /// turns into for a drive root, and a bare `C:`): reading those as "relative to the
+    /// current directory on C:" would undo the fixes for them.
+    #[test]
+    fn a_path_that_names_a_drive_is_passed_through_untouched() {
+        for p in [
+            r"C:\Users\me",
+            r"C:\",
+            "C:",
+            "D:",
+            "C:\"",
+            "C:\\Users\\me\"",
+            r"\\server\share\dir",
+        ] {
+            assert_eq!(absolute_arg(Path::new(p)), Path::new(p), "{p}");
+        }
+        // And so the seed for those is what it always was.
+        assert_eq!(
+            seed_query(&absolute_arg(Path::new("C:\"")).to_string_lossy(), None),
+            ""
+        );
+        assert_eq!(
+            seed_query(
+                &absolute_arg(Path::new(r"C:\Users\me")).to_string_lossy(),
+                None
+            ),
+            r"path:C:\Users\me "
+        );
     }
 
     #[test]

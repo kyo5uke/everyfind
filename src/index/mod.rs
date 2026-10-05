@@ -47,6 +47,20 @@ pub mod flags {
     /// stored size is a lower bound; `du` propagates a "truncated" marker up the subtree and the
     /// client notes it, so a saturated total is never silently under-reported.
     pub const SIZE_TRUNCATED: u16 = 1 << 4;
+    /// This entry's allocation has been read: by the size pass when the index was built, or
+    /// by a stat after a journal event. A file without it has never been measured and counts
+    /// as zero in `du`; [`Index::unsized_files`](super::Index::unsized_files) says how many
+    /// live ones there are.
+    pub const SIZED: u16 = 1 << 5;
+}
+
+/// Whether an entry with these `flags` is a live file nobody has measured yet.
+///
+/// A directory never is. It has no allocation of its own to read (its `du` total is the sum
+/// of what is under it), and directories created after the build are not stat'ed at all, so
+/// counting them as missing would make the count climb for as long as the daemon ran.
+fn awaits_size(flags: u16) -> bool {
+    flags & (flags::DEAD | flags::IS_DIR | flags::SIZED) == 0
 }
 
 /// A single index entry, ~20 bytes. Referenced by an internal `u32` id (its position
@@ -93,10 +107,15 @@ pub struct Index {
     /// Bytes per NTFS cluster, for converting `alloc_clusters` to bytes (M5).
     #[serde(default = "default_cluster_bytes")]
     cluster_bytes: u32,
-    /// Count of entries that received a size from the size pass, surfaced by `ef status`
-    /// (`sizes: <resolved> / <entries>`) so fail-soft misses are observable, not silent (M5).
-    #[serde(default)]
-    sizes_resolved: usize,
+    /// Live files whose allocation nobody has read yet ([`flags::SIZED`] unset): the ones `du`
+    /// counts as zero without knowing better. Surfaced by `ef status` and `ef du` so a
+    /// fail-soft miss is observable, not silent (M5).
+    ///
+    /// Kept in step by every mutation that can change it. **Not serialized**: it is a count
+    /// of flags, and the flags are what a snapshot carries, so a load recounts
+    /// ([`recount_unsized_files`](Index::recount_unsized_files)).
+    #[serde(skip)]
+    unsized_files: usize,
     /// M6 `search_contig` adoption: entry ids sorted ascending by `fold_off`, the hit->entry
     /// map for the single-pass search (+4 B/entry). **Not serialized**: rebuilt after a bulk
     /// build, a snapshot load, and (in the watch loop) after journal applies. Emptied by any
@@ -162,23 +181,68 @@ impl Index {
         self.cluster_bytes
     }
 
-    /// Count of entries that received a size from the M5 [`enum_sizes`] pass. `ef status` reports
-    /// `sizes: <resolved> / <len>` so a fail-soft resolution shortfall is observable.
-    pub fn sizes_resolved(&self) -> usize {
-        self.sizes_resolved
+    /// Live entries: everything but the tombstones.
+    pub fn live_len(&self) -> usize {
+        self.entries.len() - self.dead_entries
     }
 
-    /// Start the build-time size pass over: reset its counter and record the cluster size the
-    /// incoming numbers are denominated in.
+    /// Live files that neither the size pass nor a stat has measured. `du` counts each as
+    /// zero, so this is how much of a total is unaccounted for, in files.
+    pub fn unsized_files(&self) -> usize {
+        self.unsized_files
+    }
+
+    /// Live entries whose size is known: all of them but the
+    /// [unsized files](Self::unsized_files). `ef status` reports it against
+    /// [`live_len`](Self::live_len), so a fail-soft shortfall is observable.
+    ///
+    /// Both numbers describe the index as it stands. This used to count the entries the
+    /// build-time size pass had reached and was read against every entry ever indexed, dead
+    /// ones included, so the ratio could only fall as files came and went.
+    pub fn sizes_resolved(&self) -> usize {
+        self.live_len() - self.unsized_files
+    }
+
+    /// Live files, sized or not. A scan of the entry table, so not for a hot path.
+    pub fn live_files(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.flags & (flags::DEAD | flags::IS_DIR) == 0)
+            .count()
+    }
+
+    /// Start the size pass over: forget which entries have been measured, and record the
+    /// cluster size the incoming numbers are denominated in.
     ///
     /// For a caller about to re-run [`enum_sizes`] against an index that already exists: a
-    /// resumed snapshot whose sizes are missing. `set_size` counts every hit, so re-running
-    /// the pass without resetting would report more sizes than there are entries.
+    /// resumed snapshot whose sizes are missing. Whatever the pass does not reach this time
+    /// is then counted as unsized again, rather than passing for measured on the strength of
+    /// an earlier run.
     ///
     /// [`enum_sizes`]: crate::volume::UsnVolume::enum_sizes
     pub fn restart_size_pass(&mut self, cluster_bytes: u32) {
         self.cluster_bytes = cluster_bytes;
-        self.sizes_resolved = 0;
+        for e in &mut self.entries {
+            e.flags &= !flags::SIZED;
+        }
+        self.recount_unsized_files();
+    }
+
+    /// Recount [`unsized_files`](Self::unsized_files) from the flags.
+    ///
+    /// For the two places where the flags arrive wholesale rather than one mutation at a
+    /// time: a snapshot load, which does not carry the count, and the start of a size pass.
+    pub(crate) fn recount_unsized_files(&mut self) {
+        self.unsized_files = self.entries.iter().filter(|e| awaits_size(e.flags)).count();
+    }
+
+    /// Note that `id`'s allocation has been read.
+    fn mark_sized(&mut self, id: u32) {
+        let e = &mut self.entries[id as usize];
+        if awaits_size(e.flags) {
+            self.unsized_files -= 1;
+        }
+        e.flags |= flags::SIZED;
     }
 
     /// Set the drive letter used to prefix reconstructed paths (used by the daemon after load).
@@ -205,7 +269,7 @@ impl Index {
             if truncated {
                 self.entries[id as usize].flags |= flags::SIZE_TRUNCATED;
             }
-            self.sizes_resolved += 1;
+            self.mark_sized(id);
         }
     }
 
@@ -216,9 +280,10 @@ impl Index {
         (self.entries[id as usize].flags & flags::DEAD == 0).then(|| self.path(id))
     }
 
-    /// Live-refresh the allocated size of `frn`. Unlike [`set_size`](Self::set_size) this
-    /// does **not** bump `sizes_resolved` (that counter reflects the build-time size pass), and it
-    /// clears [`flags::SIZE_TRUNCATED`] when the file is no longer oversize.
+    /// Live-refresh the allocated size of `frn`. Unlike [`set_size`](Self::set_size) it
+    /// clears [`flags::SIZE_TRUNCATED`] when the file is no longer oversize. Like it, it marks
+    /// the entry [`flags::SIZED`]: a file created after the build has a size from the moment
+    /// a stat answers for it, and is not among the [unsized](Self::unsized_files) after that.
     pub fn update_size(&mut self, frn: u64, alloc_clusters: u32, truncated: bool) {
         if let Some(&id) = self.frn_to_id.get(&frn) {
             self.alloc_clusters[id as usize] = alloc_clusters;
@@ -227,6 +292,7 @@ impl Index {
             } else {
                 self.entries[id as usize].flags &= !flags::SIZE_TRUNCATED;
             }
+            self.mark_sized(id);
         }
     }
 

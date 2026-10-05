@@ -9,7 +9,7 @@
 
 use crate::volume::{reason, UsnEvent, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
-use super::{flags, Entry, Index, ORPHAN_SENTINEL};
+use super::{awaits_size, flags, Entry, Index, ORPHAN_SENTINEL};
 
 impl Index {
     /// Apply one USN journal event, keeping [`entries`](Index::entries) and the `frn -> id`
@@ -59,6 +59,10 @@ impl Index {
         if let Some(id) = self.frn_to_id.remove(&frn) {
             let e = &mut self.entries[id as usize];
             if e.flags & flags::DEAD == 0 {
+                // A file that goes before anyone measured it is no longer a missing size.
+                if awaits_size(e.flags) {
+                    self.unsized_files -= 1;
+                }
                 e.flags |= flags::DEAD;
                 let freed = e.name_len as usize + e.fold_len as usize;
                 self.dead_entries += 1;
@@ -121,7 +125,16 @@ impl Index {
                 // the incoming record would miss the case where a re-statement arrives without
                 // the attribute, and a missed pass is silent where a spare one is merely slow.
                 let a_directory = (flag_bits | e.flags) & flags::IS_DIR != 0;
-                e.flags = flag_bits | (e.flags & flags::SIZE_TRUNCATED);
+                // `SIZED` survives for the same reason `SIZE_TRUNCATED` does: a rename moves
+                // a name, not a measurement. Dropping it would turn every renamed file into
+                // one "without a size" while its size sat right there in `alloc_clusters`.
+                let awaited = awaits_size(e.flags);
+                e.flags = flag_bits | (e.flags & (flags::SIZE_TRUNCATED | flags::SIZED));
+                match (awaited, awaits_size(e.flags)) {
+                    (true, false) => self.unsized_files -= 1,
+                    (false, true) => self.unsized_files += 1,
+                    _ => {}
+                }
                 if was_orphan != is_orphan && a_directory {
                     self.orphans_stale = true;
                 }
@@ -140,6 +153,9 @@ impl Index {
                 // Keep the M5 size column in lockstep with `entries` (new entry -> size 0 until a
                 // live size refresh fills it). INVARIANT: alloc_clusters.len() == entries.len().
                 self.alloc_clusters.push(0);
+                if awaits_size(flag_bits) {
+                    self.unsized_files += 1;
+                }
                 self.frn_to_id.insert(frn, id);
             }
         }

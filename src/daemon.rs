@@ -245,7 +245,7 @@ struct Acquired {
 
 /// Acquire the initial index: resume the snapshot if present and valid, else full enumeration;
 /// then catch up the journal delta.
-fn acquire(vol: &mut Win32Volume, drive: char, snapshot_path: &Path) -> Result<Acquired> {
+fn acquire(vol: &mut dyn UsnVolume, drive: char, snapshot_path: &Path) -> Result<Acquired> {
     let (mut state, resumed) = if snapshot_path.exists() {
         match snapshot::load(snapshot_path) {
             Ok(loaded) => {
@@ -327,6 +327,9 @@ fn watch_loop(vol: &mut Win32Volume, shared: &Shared, cfg: &DaemonConfig) {
                 let measured = Watched::measure_sizes(vol, &a.resized);
                 if !measured.is_empty() {
                     write_watched(shared).record_sizes(&measured);
+                    // A poll that only works off the size backlog applies no events, and the
+                    // sizes it learns are as much a change to save as an event is.
+                    dirty = true;
                 }
                 // A directory that moved across the orphan boundary left its subtree behind on
                 // the wrong side. Re-derived here, in the poll that noticed, so a stale flag
@@ -671,9 +674,21 @@ fn serve_du(shared: &Shared, path: &str, depth: u32, top_n: u32, real: bool) -> 
     }
     let w = read_watched(shared);
     let Some(id) = w.index.resolve_path(path) else {
+        // "Not found" would be true of a path on another drive, and no help: say that the
+        // drive is not one this daemon indexes, which is the thing to know.
+        let message = match path.split_once(':') {
+            Some((letter, _)) if letter.chars().count() == 1 && !w.index.is_drive(letter) => {
+                format!(
+                    "{}:\\ is not indexed; Everyfind indexes only {}:\\ (one volume per daemon).",
+                    letter.to_ascii_uppercase(),
+                    w.drive()
+                )
+            }
+            _ => format!("path not found in the index: {path}"),
+        };
         return Response::Error {
             code: ErrCode::BadRequest,
-            message: format!("path not found in the index: {path}"),
+            message,
         };
     };
     // Clamped for the same reason `Search`'s `limit` is, and it was not: both size real work
@@ -700,8 +715,10 @@ fn serve_du(shared: &Shared, path: &str, depth: u32, top_n: u32, real: bool) -> 
         truncated: rep.truncated,
         real: false,
         rows,
+        // Out of the live entries, not out of every entry the index has ever held: a deleted
+        // file is not a file whose size is missing.
         sizes_resolved: w.index.sizes_resolved() as u64,
-        entries: w.index.len() as u64,
+        entries: w.index.live_len() as u64,
     }
 }
 
@@ -798,6 +815,153 @@ mod tests {
     use super::*;
     use crate::ipc::acl::AclMode;
     use crate::ipc::server::PipeServer;
+    use crate::volume::{FakeEvent, FakeRecord, FakeVolume};
+
+    /// A ready daemon's shared state around `watched`, with no pipe and no volume behind it.
+    fn ready(watched: Watched) -> Shared {
+        Shared {
+            watched: RwLock::new(watched),
+            meta: Mutex::new(Meta::new('T', Duration::from_millis(1000))),
+            phase: std::sync::atomic::AtomicU8::new(phase::READY),
+            build_progress: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The two numbers `ef du` and `ef status` send so a client can tell a total it should
+    /// not trust: how many entries have a size, out of how many there are.
+    ///
+    /// They have to describe the index as it stands. They did not: the count of sized entries
+    /// only ever rose during the build, and it was held against every entry the index had
+    /// ever seen, deleted ones included. So the ratio could only fall, by a little with every
+    /// file created or removed, and after ten days of an ordinary desktop `ef du` announced
+    /// that "the size pass did not complete" on an index whose live files all had their sizes.
+    #[test]
+    fn size_coverage_counts_live_entries_and_sizes_learned_since_the_build() {
+        // Three files sized by the build. Then two of them go and a new one arrives, to be
+        // sized by a stat: the journal's ordinary business.
+        let mut vol = FakeVolume::new(vec![
+            FakeRecord::dir(5, 5, ""),
+            FakeRecord::file(30, 5, "a.bin").size(1),
+            FakeRecord::file(31, 5, "b.bin").size(1),
+            FakeRecord::file(32, 5, "c.bin").size(1),
+        ])
+        .with_events(vec![
+            FakeEvent::delete(100, 30, 5, "a.bin").close(),
+            FakeEvent::delete(101, 31, 5, "b.bin").close(),
+            FakeEvent::create(102, 40, 5, "new.bin").close(),
+        ])
+        .with_live_sizes([(40u64, (2u32, false))]);
+        vol.set_journal(1, 0, 0);
+        let mut watched = Watched::enumerate(&mut vol, 'T').expect("build");
+        let Synced::Applied(a) = watched.sync(&mut vol).expect("sync") else {
+            panic!("the journal did not apply");
+        };
+        watched.refresh_sizes(&vol, &a.resized);
+        let shared = ready(watched);
+
+        // What is left: the root, c.bin and new.bin, and nothing among them lacks a size.
+        let Response::Du {
+            total_bytes,
+            sizes_resolved,
+            entries,
+            ..
+        } = serve_du(&shared, "T:\\", 1, 10, false)
+        else {
+            panic!("du did not answer");
+        };
+        assert_eq!(total_bytes, 3 * 4096, "c.bin (1 cluster) + new.bin (2)");
+        assert_eq!(
+            (sizes_resolved, entries),
+            (3, 3),
+            "du: every live entry has a size, and only live entries are counted"
+        );
+
+        let status = build_status(&shared);
+        assert_eq!(
+            (status.sizes_resolved, status.live_entries),
+            (3, 3),
+            "status: the same two numbers"
+        );
+    }
+
+    /// `du` of a path on a drive this daemon does not index is refused, with the reason. It
+    /// used to answer with the indexed volume's own root, labelled as the drive that was
+    /// asked for.
+    #[test]
+    fn du_of_another_drive_is_refused_with_the_reason() {
+        let mut vol = FakeVolume::new(vec![
+            FakeRecord::dir(5, 5, ""),
+            FakeRecord::file(30, 5, "a.bin").size(1),
+        ]);
+        vol.set_journal(1, 0, 0);
+        let shared = ready(Watched::enumerate(&mut vol, 'T').expect("build"));
+
+        for asked in ["D:\\", "d:\\some\\folder", "D:"] {
+            let Response::Error { code, message } = serve_du(&shared, asked, 1, 10, false) else {
+                panic!("du {asked} was answered");
+            };
+            assert_eq!(code, ErrCode::BadRequest);
+            assert!(
+                message.contains("D:\\ is not indexed") && message.contains("T:\\"),
+                "the reason, naming both drives: {message}"
+            );
+        }
+        // A path that is simply absent on the right drive is still "not found", not this.
+        let Response::Error { message, .. } = serve_du(&shared, "T:\\nope", 1, 10, false) else {
+            panic!("du of a missing path was answered");
+        };
+        assert!(message.contains("not found"), "{message}");
+        assert!(matches!(
+            serve_du(&shared, "t:\\", 1, 10, false),
+            Response::Du { .. }
+        ));
+    }
+
+    /// A snapshot this build cannot read is not something to die on, and not something to
+    /// trust either: the index is enumerated from the volume, as if no snapshot were there.
+    ///
+    /// This is the first start after any upgrade that changes the snapshot format, on every
+    /// machine that has the old version installed.
+    #[test]
+    fn a_snapshot_from_the_previous_format_is_enumerated_over_not_resumed() {
+        let dir = std::env::temp_dir().join(format!("ef-old-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("index.snapshot");
+
+        // What the older daemon left behind: a well-formed snapshot of a volume that has
+        // since changed, under the format number this build no longer reads.
+        let mut then = FakeVolume::new(vec![
+            FakeRecord::dir(5, 5, ""),
+            FakeRecord::file(30, 5, "since-deleted.bin").size(9),
+        ]);
+        then.set_journal(1, 0, 0);
+        let old = Watched::enumerate(&mut then, 'T').expect("build");
+        snapshot::save_as_previous_version(&path, &old.index, old.journal_id, old.next_usn)
+            .expect("save");
+        assert!(
+            snapshot::load(&path).is_err(),
+            "precondition: this build refuses the previous format"
+        );
+
+        let mut now = FakeVolume::new(vec![
+            FakeRecord::dir(5, 5, ""),
+            FakeRecord::file(31, 5, "current.bin").size(4),
+        ]);
+        now.set_journal(1, 0, 0);
+        let acquired = acquire(&mut now, 'T', &path).expect("an unreadable snapshot is not fatal");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!acquired.resumed, "nothing was resumed");
+        let index = &acquired.watched.index;
+        assert!(index.resolve_path(r"T:\current.bin").is_some());
+        assert!(
+            index.resolve_path(r"T:\since-deleted.bin").is_none(),
+            "the old snapshot's contents must not survive"
+        );
+        assert_eq!(index.unsized_files(), 0, "the enumeration read the sizes");
+        let root = index.resolve_path("T:\\").expect("root");
+        assert_eq!(index.du(root, 1, 10).total_clusters, 4);
+    }
 
     /// A connected pair on a name of this test's own.
     fn pair(tag: &str) -> (PipeStream, PipeStream) {

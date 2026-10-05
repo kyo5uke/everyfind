@@ -47,6 +47,20 @@ $candidates = @(
 if ($InstallDir) { $candidates = @($InstallDir) }
 $found = @($candidates | Where-Object { Test-Path (Join-Path $_ 'ef.exe') })
 
+# This may be the copy the installer left next to the binaries, run from inside the directory
+# it is about to delete. Windows will not remove a directory that is some process's current
+# one (Remove-Item fails with "in use"), so step out of it first. Before the elevated
+# re-launch too: the shell that waits for that one would go on holding the directory.
+$here = (Get-Location).ProviderPath
+foreach ($dir in $found) {
+    $inside = $dir.TrimEnd('\') + '\'
+    if ($here -eq $dir.TrimEnd('\') -or $here.StartsWith($inside, [StringComparison]::OrdinalIgnoreCase)) {
+        Set-Location $env:TEMP
+        Say "left $dir, which is about to be removed; this shell is now in $env:TEMP"
+        break
+    }
+}
+
 # A service was registered only by the machine-wide route, and only that route needs
 # Administrator to undo. Asking for it when there is nothing to undo would be theatre.
 $svc = Get-Service everyfind -ErrorAction SilentlyContinue

@@ -44,10 +44,19 @@ impl Index {
     /// Resolve a path string (`"C:\Users\foo"`, `"C:\"`, or `"C:"`) to an internal id, or `None`
     /// if it is not in the index. Case-insensitive (Windows paths), via the shared fold. A bare
     /// drive (`"C:\"`) resolves to the root.
+    ///
+    /// A path that names another drive is not in the index, whatever comes after the letter.
     pub fn resolve_path(&self, path: &str) -> Option<u32> {
-        // Strip an optional `<drive>:` prefix; the remainder is `\`-separated components.
+        // An optional `<drive>:` prefix; the remainder is `\`-separated components. The prefix
+        // has to be this index's own drive: it used to be dropped unread, so `D:\` resolved to
+        // this volume's root and `ef du D:\` reported C:'s usage under D:'s name.
         let rest = match path.split_once(':') {
-            Some((_drive, rest)) => rest,
+            Some((drive, rest)) => {
+                if !self.is_drive(drive) {
+                    return None;
+                }
+                rest
+            }
             None => path,
         };
         let mut cur = self.root;
@@ -65,6 +74,15 @@ impl Index {
             cur = child?;
         }
         Some(cur)
+    }
+
+    /// Whether `letter`, the text before a path's `:`, names the drive this index is of.
+    pub fn is_drive(&self, letter: &str) -> bool {
+        let mut chars = letter.chars();
+        matches!(
+            (chars.next(), chars.next()),
+            (Some(c), None) if c.eq_ignore_ascii_case(&self.drive)
+        )
     }
 
     /// Disk-usage report for the subtree rooted at `path_id`: the recursive total, and the largest

@@ -52,6 +52,6 @@
 | --- | --- | --- |
 | GitHub Releases | **済** | リポジトリ公開 + `v*` タグ。release.yml が zip と SHA256SUMS を作る |
 | cargo install --git | **済** | リポジトリ公開のみ |
-| scoop | 未 | ① 初回リリースの SHA256 を `packaging/scoop/everyfind.json` の `hash` に入れる（今は `REPLACE-WITH-...` のまま）② README に書く raw URL のブランチ名を既定ブランチに合わせる（`main` 決め打ちになっている） |
+| scoop | 未 | ① 初回リリースの SHA256 を `packaging/scoop/everyfind.json` の `hash` に入れる（v0.1.0 の値を記入済み）② README に書く raw URL のブランチ名を既定ブランチに合わせる（`main` 決め打ちになっている） |
 | cargo binstall | 未 | crates.io publish が要る。その前に `everyfind-ipc` を publish して、`Cargo.toml` の path 依存を `{ version = "…", path = "ipc" }` に変える（path のみの依存は publish できない） |
 | winget | 未 | Releases 公開後に microsoft/winget-pkgs へ manifest を PR。審査あり |

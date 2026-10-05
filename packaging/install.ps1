@@ -164,7 +164,10 @@ if ($svc -and $svc.Status -ne 'Stopped' -and (Test-Path (Join-Path $InstallDir '
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $copied = 0
-foreach ($f in @('ef.exe', 'efd.exe', 'ef-index.exe', 'ef_search_engine.dll',
+# uninstall.ps1 goes with the binaries. The unzipped release is the kind of folder that gets
+# deleted once the install has worked, and this script ends by saying how to remove
+# everything: that has to name something that will still be there.
+foreach ($f in @('ef.exe', 'efd.exe', 'ef-index.exe', 'ef_search_engine.dll', 'uninstall.ps1',
                  'README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.txt')) {
     $p = Join-Path $src $f
     if (-not (Test-Path $p)) { continue }
@@ -260,6 +263,11 @@ if (-not $WithExplorer) {
     Write-Host "# writes 3 per-user COM keys; undo with 'uninstall'" -ForegroundColor DarkGray
 }
 Write-Host ""
-Write-Host "  Remove everything:  .\uninstall.ps1" -ForegroundColor DarkGray
+$uninstaller = Join-Path $InstallDir 'uninstall.ps1'
+if (Test-Path $uninstaller) {
+    Write-Host "  Remove everything:  & `"$uninstaller`"" -ForegroundColor DarkGray
+} else {
+    Write-Host "  Remove everything:  uninstall.ps1, from the release this was installed from" -ForegroundColor DarkGray
+}
 Write-Host ""
 Hold

@@ -19,7 +19,10 @@ const MAGIC: u32 = 0x4e53_6665;
 /// Snapshot format version. Bump on any incompatible change to `Index` / `Entry` / arena
 /// layout so old files are rejected rather than misread.
 /// - v2 (M5): `Index` gained `alloc_clusters` / `cluster_bytes` / `sizes_resolved` (`ef du`).
-const FORMAT_VERSION: u32 = 2;
+/// - v3: `sizes_resolved` is gone, and which entries have a size is carried per entry, in
+///   `flags::SIZED`. A v2 file has that bit clear everywhere, so even with the layout aside
+///   it would read as an index in which nothing was ever measured.
+const FORMAT_VERSION: u32 = 3;
 
 /// A restored snapshot: the index plus the journal cursor to resume tailing from.
 pub struct Loaded {
@@ -36,6 +39,23 @@ pub struct Loaded {
 /// several hundred megabytes, taken at the moment this project's known weak point is build RAM,
 /// and taken while holding the index read lock.
 pub fn save(path: &Path, index: &Index, journal_id: u64, next_usn: u64) -> Result<()> {
+    save_as(path, index, journal_id, next_usn, FORMAT_VERSION)
+}
+
+/// A snapshot stamped with the format version before this one, which is what every installed
+/// daemon finds on disk the first time it starts after an upgrade that changed the format.
+/// For tests of that start.
+#[cfg(test)]
+pub(crate) fn save_as_previous_version(
+    path: &Path,
+    index: &Index,
+    journal_id: u64,
+    next_usn: u64,
+) -> Result<()> {
+    save_as(path, index, journal_id, next_usn, FORMAT_VERSION - 1)
+}
+
+fn save_as(path: &Path, index: &Index, journal_id: u64, next_usn: u64, version: u32) -> Result<()> {
     // Appended, not substituted: `--snapshot index.snapshot` and `--snapshot index.bak` both
     // produced `index.tmp` with `with_extension`, so two daemons on different volumes tore each
     // other's writes.
@@ -46,8 +66,7 @@ pub fn save(path: &Path, index: &Index, journal_id: u64, next_usn: u64) -> Resul
     {
         let f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut w = std::io::BufWriter::new(f);
-        bincode::serialize_into(&mut w, &(MAGIC, FORMAT_VERSION))
-            .context("encoding snapshot header")?;
+        bincode::serialize_into(&mut w, &(MAGIC, version)).context("encoding snapshot header")?;
         bincode::serialize_into(&mut w, &(journal_id, next_usn, index))
             .context("encoding snapshot")?;
         // Flush before the rename, or the rename can publish a short file.
@@ -76,8 +95,10 @@ pub fn load(path: &Path) -> Result<Loaded> {
         bail!("snapshot format version {version} != {FORMAT_VERSION} (re-enumeration required)");
     }
 
-    let (journal_id, next_usn, index): (u64, u64, Index) =
+    let (journal_id, next_usn, mut index): (u64, u64, Index) =
         bincode::deserialize_from(&mut cur).context("decoding snapshot body")?;
+    // Derived from the flags just read rather than stored beside them.
+    index.recount_unsized_files();
     // The version byte is the only thing standing between a changed `Index` layout and a
     // silently misread index, and it depends on somebody remembering to bump it. bincode
     // carries no schema: two same-width fields swapped, or a field removed, decodes cleanly

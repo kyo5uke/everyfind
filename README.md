@@ -10,11 +10,11 @@
 
 ```text
 ef notes            # every file and folder whose name contains "notes" — about 14 ms
-ef                  # interactive: type to narrow, Enter prints the path
+ef                  # interactive: type to narrow, Enter opens the file
 ef du C:\Users      # what's eating space under C:\Users — straight from the index
 ```
 
-It works the way [Everything](https://www.voidtools.com/) (voidtools) does: it reads the NTFS Master File Table directly to build an index of every filename in seconds, then tails the USN change journal to keep it current. Searching never walks a directory. Optionally, it can also [answer Explorer's own search box](#explorer-integration) from that index.
+It works the way [Everything](https://www.voidtools.com/) (voidtools) does: it reads the NTFS Master File Table directly to build an index of every filename, then tails the USN change journal to keep it current. Searching never walks a directory. Optionally, it can also [answer Explorer's own search box](#explorer-integration) from that index.
 
 ## Install
 
@@ -54,7 +54,7 @@ To install from source, with Rust stable and the MSVC toolchain:
 cargo install --git https://github.com/kyo5uke/everyfind
 ```
 
-To remove everything, run `.\uninstall.ps1`. It takes out the service, its data, the `PATH` entry, the registry keys, and the binaries.
+To remove everything, run `uninstall.ps1`: the one in the unzipped release, or the copy the installer leaves next to the binaries (`& "$env:ProgramFiles\Everyfind\uninstall.ps1"`). It takes out the service, its data, the `PATH` entry, the registry keys, and the binaries.
 
 ### SmartScreen and Defender
 
@@ -97,16 +97,37 @@ ef du [path]          # the biggest folders and files under path (default: the v
 ef status             # daemon health: entries, journal lag, memory, uptime
 ```
 
+### In a pipeline
+
+When its output is piped or captured, `ef <query>` prints one absolute path per line and nothing else, so it can feed another command directly:
+
+```text
+ef ext:iso | Select-Object -First 3
+ef ext:iso | ForEach-Object { (Get-Item -LiteralPath $_).Length }
+```
+
+With no `-n`, a pipe gets every match the daemon returns (at most 100,000 per query); at a terminal you get the first 20 under a count, and `-n` changes either. The exit code is 0 when something matched, 1 when nothing did, and 2 when the search couldn't be run, as with `grep`.
+
+Windows PowerShell 5.1 decodes a program's output with the console's code page rather than as UTF-8, so a path containing non-ASCII characters (Japanese, for one) arrives garbled when it is piped or stored in a variable. Run this first, or put it in your profile:
+
+```text
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+```
+
+What is printed straight to the terminal is not affected.
+
 ### Interactive
 
-Type and it searches as you go. `↑` `↓` `PgUp` `PgDn` move the selection, **Enter** prints the selected path to stdout and exits, **Ctrl+Y** copies the path, **Ctrl+E** reveals the file in Explorer, **Ctrl+O** opens it with its associated program, **Esc** / **Ctrl+C** quits.
+Type and it searches as you go. `↑` `↓` `PgUp` `PgDn` move the selection. **Enter** opens the selected file or folder with its associated program (**Ctrl+O** does the same), **Ctrl+Enter** (or **Ctrl+J**) prints its path to stdout and exits, **Ctrl+Y** copies the path, **Ctrl+E** reveals it in Explorer, **Esc** / **Ctrl+C** quits. In the query, **Ctrl+U** clears the line and **Ctrl+W** deletes the word before the cursor.
 
-The screen is drawn on stderr; stdout carries only the path you chose with Enter. It's built to be combined with a shell:
+The screen is drawn on stderr; stdout carries only the path you chose. It's built to be combined with a shell:
 
 ```text
 vim $(ef)             # pick a file interactively, open it in vim
 $dir = ef; cd $dir    # PowerShell: jump to a directory you picked
 ```
+
+When the output is captured like this, a path is what the shell is waiting for, so there plain **Enter** prints it too (and **Ctrl+O** is the key that opens). The line of keys on the empty screen always shows which one applies.
 
 ### Disk usage
 
@@ -115,6 +136,7 @@ $dir = ef; cd $dir    # PowerShell: jump to a directory you picked
 ```text
 ef du                 # the biggest things on the volume
 ef du C:\Users -d 2   # two levels deep
+ef du .               # the folder you are in (relative paths work)
 ef du -n 50 --bytes   # more rows, raw byte counts
 ```
 
@@ -134,14 +156,28 @@ ef content "TODO.*deprecat"     # ripgrep-compatible regex
 Everything's query language. A space is AND, `|` is OR, `!` negates, `<…>` groups. NOT binds tightest, then AND, then OR.
 
 ```text
-ef report 2024                  # both words
-ef "annual report"              # quotes keep the space inside one term
-ef cargo.toml | package.json    # either
-ef readme <ext:md | ext:txt>    # grouping overrides precedence
-ef log !cache !ext:tmp;bak      # negation
-ef *.dll                        # wildcards match the whole name (* and ?)
-ef src\util                     # a term with a separator matches the path
+ef report 2024                    # both words
+ef 'cargo.toml | package.json'    # either
+ef 'readme <ext:md | ext:txt>'    # grouping overrides precedence
+ef 'log !cache !ext:tmp;bak'      # negation
+ef *.dll                          # wildcards match the whole name (* and ?)
+ef src\util                       # a term with a separator matches the path
+ef '\"annual report\"'            # a phrase: the double quotes keep the space inside one term
 ```
+
+These are written for PowerShell. A query has to get past the shell before `ef` sees it, and `|`, `<`, `>`, `;` and `!` all mean something to a shell, so a query that contains one goes inside quotes as a whole: single quotes in PowerShell and bash, double quotes in cmd.exe (`ef "cargo.toml | package.json"`). bash also needs them around `*.dll` and `src\util`.
+
+A phrase carries double quotes of its own, and those have to arrive too. How to write that depends on the shell:
+
+```text
+ef '\"annual report\"'     # Windows PowerShell 5.1
+ef '"annual report"'       # PowerShell 7.3 and later, bash
+ef "\"annual report\""     # cmd.exe
+```
+
+Without them, `ef "annual report"` is the two words `annual` and `report`: the shell takes the quotes for itself. In the interactive screen there's no shell in between, so a query is typed exactly as it is.
+
+A first word that is also a subcommand (`status`, `du`, `config`, `content` or its short form `c`, `service`, `shell`, `explorer`, `help`) runs that subcommand. To search for the word instead, put `--` in front of it: `ef -- status`. Options go before the `--` (`ef -n 50 -- status`).
 
 Modifiers change how the term after them is read, and they stack.
 
@@ -177,7 +213,7 @@ What's missing, and what's limited:
 - There are no date filters (`dm:` `dc:` `da:`). The MFT *enumeration* the index is built from doesn't return timestamps; reading them means parsing raw MFT records.
 - `size:` is the **allocated** size in whole clusters (the same value `ef du` collects). A one-byte file reports one cluster.
 - `attrib:` knows only the two bits the index carries.
-- File contents aren't indexed. (`ef content <regex>` is a separate engine that runs without the index.)
+- File contents aren't in the name index; `ef content <regex>` searches them with a separate engine.
 
 Results are ranked: exact name matches first, then name-prefix matches, then substring hits; ties prefer the shorter path. Case-insensitive by default.
 
@@ -244,8 +280,8 @@ cost scales with your hardware; the index answers from memory either way.
 
 ## How it works
 
-- The first index comes from enumerating the Master File Table directly (`FSCTL_ENUM_USN_DATA`), the ledger NTFS keeps of every file. Nothing walks a directory, which is why millions of files take seconds rather than minutes.
-- After that the daemon polls the USN journal (NTFS's record of every change) roughly every 500 ms and applies creates, deletes, renames, and moves to the index. Idling costs next to nothing. If the journal wraps or breaks, that gets detected and the index is rebuilt from a fresh enumeration.
+- The first index comes from enumerating the Master File Table directly (`FSCTL_ENUM_USN_DATA`), the ledger NTFS keeps of every file. Nothing walks a directory, which is why 4.7M files take about 10 seconds on a fast desktop.
+- After that the daemon polls the USN journal (NTFS's record of every change) about once a second and applies creates, deletes, renames, and moves to the index. Idling costs next to nothing. If the journal wraps or breaks, that gets detected and the index is rebuilt from a fresh enumeration.
 - The index holds a filename and a link to its parent per entry, and reconstructs full paths on demand. Around 90–110 MB resident per million files. Search is a case-insensitive parallel substring scan.
 - `ef du` sizes come from `$MFT` itself: allocated cluster counts are read from each file's data runs while indexing, and kept current by the journal tail. That's why aggregating the whole volume is a pure in-memory pass.
 - Only read FSCTLs are issued through the volume handle; Everyfind never writes to the volume it indexes. Its own state (snapshot, logs) lives in `C:\ProgramData\everyfind`.
@@ -261,8 +297,6 @@ Reading the MFT and the USN journal through a raw volume handle (`\\.\C:`) is pr
 - The terminal is where it lives. An interactive screen, and a one-shot search that prints plain paths to stdout. It combines with a shell (`vim $(ef)`) and works over SSH. Everything's CLI (`es.exe`) needs the Everything GUI app or its service to be running; Everyfind is self-contained.
 - It's open source. MIT or Apache-2.0, plain Rust, no bundled UI framework.
 - `du` is built in. Disk-usage aggregation comes from the same live index as search.
-
-In short: the search tool I always wanted.
 
 ## Known limitations (v0.1)
 

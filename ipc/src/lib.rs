@@ -174,7 +174,8 @@ pub enum Response {
         truncated: bool,
         real: bool,
         rows: Vec<DuRowWire>,
-        /// How many entries carry a size, out of how many exist.
+        /// How many live entries have a size, out of how many live entries there are. The
+        /// difference is the files `du` counted as zero because nobody has measured them.
         ///
         /// Sent so the client can refuse to present a total it has no business presenting. The
         /// size pass is fail-soft by design: a fragmented `$MFT`, an unreadable geometry, a
@@ -212,8 +213,9 @@ pub struct StatusReport {
     pub entries: u64,
     /// Live (non-`DEAD`) entries.
     pub live_entries: u64,
-    /// Entries that received an `ef du` size from the size pass (M5). `< entries` reveals a
-    /// fail-soft resolution shortfall (surfaced as `sizes: <resolved> / <entries>`).
+    /// Live entries whose `ef du` size is known (M5): `live_entries` less the files nobody has
+    /// measured. `< live_entries` reveals a fail-soft shortfall (surfaced as
+    /// `sizes: <resolved> / <live>`).
     pub sizes_resolved: u64,
     /// Volume `next_usn` minus our applied cursor, as of the last poll (0 = caught up).
     pub usn_lag: u64,

@@ -39,7 +39,7 @@ struct Args {
     #[arg(long, default_value = "C:")]
     volume: String,
 
-    /// Pipe access mode: `interactive` (default; non-elevated `ef` works) or `admins`.
+    /// Who may search: `interactive` (anyone logged on; a non-elevated `ef` works) or `admins`.
     #[arg(long, default_value = "interactive")]
     acl: String,
 

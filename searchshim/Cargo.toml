@@ -8,7 +8,7 @@
 # workflow builds it here and drops the result into the archive as ef_search_engine.dll.
 [package]
 name = "searchshim"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 

@@ -9,7 +9,7 @@ members = ["ipc"]
 
 [package]
 name = "everyfind"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.96"
 description = "Instant filename search for Windows (a terminal Everything), powered by NTFS MFT + USN journal"

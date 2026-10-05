@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/kyo5uke/everyfind/releases/download/v0.1.0/everyfind-x86_64-pc-windows-msvc-v0.1.0.zip",
-            "hash": "REPLACE-WITH-SHA256SUMS-VALUE-ON-FIRST-RELEASE"
+            "hash": "277704f080236f6df165f50027c14e8e6517b951c943aa03017dc7fa4f353990"
         }
     },
     "bin": [

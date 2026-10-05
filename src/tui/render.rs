@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, app: &AppState, list: &mut ListState) {
 
     render_input(frame, app, input_area);
     if app.is_query_empty() {
-        render_hint(frame, body_area);
+        render_hint(frame, app, body_area);
     } else {
         render_results(frame, app, list, body_area);
     }
@@ -66,7 +66,7 @@ fn render_results(frame: &mut Frame, app: &AppState, state: &mut ListState, area
     let items: Vec<ListItem> = app
         .results()
         .iter()
-        .map(|hit| ListItem::new(result_line(hit, &query)))
+        .map(|hit| ListItem::new(result_line(hit, &query, area.width as usize)))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     // `state` outlives the frame on purpose; see `Ui::list`. ratatui reads the offset, scrolls
@@ -80,21 +80,66 @@ fn render_results(frame: &mut Frame, app: &AppState, state: &mut ListState, area
     frame.render_stateful_widget(list, area, state);
 }
 
-/// Compose one result row: the path with the query occurrences highlighted in the filename, plus
-/// a trailing `\` marker for directories.
-fn result_line(hit: &SearchHit, query: &str) -> Line<'static> {
+/// What stands in for the front of a path that does not fit its row. ASCII, like the rest of
+/// the chrome: `…` is one cell in some terminals and two in others (see [`render_hint`]).
+const ELIDED: &str = "...";
+
+/// Where to start showing `path` so that it fits `width` cells with [`ELIDED`] in front of it:
+/// a byte offset, at a `\`. `0` means show all of it.
+///
+/// The front is what goes, because the name is at the back, and the name is what tells one
+/// row from the next. Clipped on the right, which is what a row too long for the terminal
+/// used to get, three files in one deep folder were three identical rows. Folders are dropped
+/// whole, nearest the root first, until what is left fits.
+///
+/// Measured in cells, not bytes or chars: a Japanese character or an emoji takes two, and the
+/// arithmetic is ratatui's own, so the row and this agree on what fits. The offset it returns
+/// is still a byte offset, which is what the highlight spans are in.
+fn elide_from(path: &str, width: usize) -> usize {
+    let cells = |s: &str| Span::raw(s).width();
+    if cells(path) <= width {
+        return 0;
+    }
+    let room = width.saturating_sub(ELIDED.len());
+    let mut last = 0;
+    for (at, _) in path.match_indices('\\') {
+        if cells(&path[at..]) <= room {
+            return at;
+        }
+        last = at;
+    }
+    // Not even the name fits. Show it from its start and let the row clip its end, which is
+    // the better end to lose: names differ sooner than they finish.
+    last
+}
+
+/// Compose one result row for a row `width` cells wide: the path, shortened from the front if
+/// it is too long ([`elide_from`]), with the query occurrences highlighted in the filename,
+/// plus a trailing `\` marker for directories.
+fn result_line(hit: &SearchHit, query: &str, width: usize) -> Line<'static> {
     let path = &hit.path;
     let hl = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
 
     let mut spans: Vec<Span> = Vec::new();
-    let mut pos = 0usize;
+    // The directory marker needs a cell of its own.
+    let cut = elide_from(path, width.saturating_sub(usize::from(hit.is_dir)));
+    if cut > 0 {
+        spans.push(Span::styled(ELIDED, Style::default().fg(Color::DarkGray)));
+    }
+    // Everything below slices the *original* path by its original byte offsets, starting at
+    // the cut, so the highlight spans need no translation. They lie in the filename and the
+    // cut is at or before the `\` in front of it; the `max` is for a span that ever is not.
+    let mut pos = cut;
     for (s, e) in query_spans(path, query) {
+        let (s, e) = (s.max(pos), e.max(pos));
         if s > pos {
             spans.push(Span::raw(path[pos..s].to_string()));
         }
-        spans.push(Span::styled(path[s..e].to_string(), hl));
+        if e > s {
+            spans.push(Span::styled(path[s..e].to_string(), hl));
+        }
         pos = e;
     }
     if pos < path.len() {
@@ -109,19 +154,24 @@ fn result_line(hit: &SearchHit, query: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_hint(frame: &mut Frame, area: Rect) {
+fn render_hint(frame: &mut Frame, app: &AppState, area: Rect) {
     let dim = Style::default().fg(Color::DarkGray);
+    // ASCII only: `↑↓` and `·` are East-Asian *ambiguous* width: one
+    // cell in Windows Terminal, two in classic conhost with a Japanese
+    // font. ratatui counts one, so the line rendered wider than its
+    // buffer said and the tail of "quit" survived every redraw.
+    //
+    // What Enter does depends on who is waiting for the answer, and the line that names the
+    // keys has to say which it is this time.
+    let keys = if app.enter_prints() {
+        "  Up/Down move | Enter print | ^O open | ^E reveal | ^Y copy | Esc quit"
+    } else {
+        "  Up/Down move | Enter open | ^E reveal | ^Y copy | ^Enter print | Esc quit"
+    };
     let lines = vec![
         Line::from(""),
         Line::styled("  Type to search filenames.", dim),
-        Line::styled(
-            // ASCII only: `↑↓` and `·` are East-Asian *ambiguous* width: one
-            // cell in Windows Terminal, two in classic conhost with a Japanese
-            // font. ratatui counts one, so the line rendered wider than its
-            // buffer said and the tail of "quit" survived every redraw.
-            "  Up/Down move | Enter open | ^E reveal | ^Y copy | ^Enter print | Esc quit",
-            dim,
-        ),
+        Line::styled(keys, dim),
     ];
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -288,6 +338,129 @@ mod tests {
         assert!(body.contains("System32\\"), "dir marker missing: {body:?}");
     }
 
+    /// Row `y` as it reads on screen: a wide character once, not once per cell it covers.
+    fn text(buf: &Buffer, y: u16) -> String {
+        let mut out = String::new();
+        let mut x = 0;
+        while x < buf.area().width {
+            let symbol = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+            out.push_str(symbol);
+            x += Span::raw(symbol).width().max(1) as u16;
+        }
+        out.trim_end().to_string()
+    }
+
+    /// A path too long for the row loses its beginning, not its end. The name is at the end,
+    /// and it is what tells one result from the next: clipped on the right, the files of one
+    /// deep folder were so many identical rows.
+    #[test]
+    fn a_path_too_long_for_the_row_keeps_its_filename() {
+        let mut app = AppState::new("probe");
+        app.dispatch_current(); // req_gen -> 1
+        app.on_response(
+            1,
+            search(
+                &[
+                    (
+                        r"C:\Users\kyosuke\dev\test\everyfind\play\probe-one.txt",
+                        false,
+                    ),
+                    (
+                        r"C:\Users\kyosuke\dev\test\everyfind\play\probe-two.txt",
+                        false,
+                    ),
+                ],
+                2,
+            ),
+            1,
+        );
+        let buf = draw(&app, 40, 5);
+        // As many whole folders as fit, counted from the name outwards, behind a marker.
+        assert_eq!(text(&buf, 1), r"...\test\everyfind\play\probe-one.txt");
+        assert_eq!(text(&buf, 2), r"...\test\everyfind\play\probe-two.txt");
+
+        // With room for all of it, nothing is cut.
+        let buf = draw(&app, 60, 5);
+        assert_eq!(
+            text(&buf, 1),
+            r"C:\Users\kyosuke\dev\test\everyfind\play\probe-one.txt"
+        );
+    }
+
+    /// The cut does not move the highlight. Match spans are byte offsets and the row is laid
+    /// out in cells, with a Japanese character or an emoji two cells wide, so a path that
+    /// loses its front has to keep both in step.
+    #[test]
+    fn eliding_a_path_leaves_the_highlight_on_the_matched_characters() {
+        let mut app = AppState::new("見積書");
+        app.dispatch_current(); // req_gen -> 1
+        app.on_response(
+            1,
+            search(
+                &[
+                    (r"C:\x\first 見積書.txt", false),
+                    (
+                        r"C:\Users\kyosuke\ドキュメント\営業資料\2024年度\😀 見積書 最終版.xlsx",
+                        false,
+                    ),
+                ],
+                2,
+            ),
+            1,
+        );
+        let buf = draw(&app, 40, 5);
+        // The second row is not the selected one, so its colors are its own.
+        assert_eq!(text(&buf, 2), r"...\2024年度\😀 見積書 最終版.xlsx");
+        // `...\2024年度\😀 ` is 3 + 1 + 8 + 1 + 2 + 1 = 16 cells; each of 見, 積, 書 is 2.
+        assert_eq!(
+            cells_with_fg(&buf, 2, Color::Yellow),
+            vec![
+                (16, "見".to_string()),
+                (18, "積".to_string()),
+                (20, "書".to_string())
+            ]
+        );
+    }
+
+    /// A name longer than the row on its own: the folders all go, and the name is shown from
+    /// its start for as far as the row reaches.
+    #[test]
+    fn a_filename_longer_than_the_row_is_shown_from_its_start() {
+        let mut app = AppState::new("report");
+        app.dispatch_current(); // req_gen -> 1
+        app.on_response(
+            1,
+            search(
+                &[(
+                    r"C:\some\folder\report-with-a-very-long-descriptive-name-2024.xlsx",
+                    false,
+                )],
+                1,
+            ),
+            1,
+        );
+        let buf = draw(&app, 30, 4);
+        assert_eq!(text(&buf, 1), r"...\report-with-a-very-long-de");
+    }
+
+    /// A directory keeps its trailing marker when its path is cut.
+    #[test]
+    fn an_elided_directory_keeps_its_marker() {
+        let mut app = AppState::new("play");
+        app.dispatch_current(); // req_gen -> 1
+        app.on_response(
+            1,
+            search(&[(r"C:\Users\kyosuke\dev\test\everyfind\play", true)], 1),
+            1,
+        );
+        // `...\test\everyfind\play` is 23 cells and the marker makes 24: it all fits in 24,
+        // and in 23 a folder has to go so that the marker still has its cell.
+        let buf = draw(&app, 24, 4);
+        assert_eq!(text(&buf, 1), r"...\test\everyfind\play\");
+        let buf = draw(&app, 23, 4);
+        assert_eq!(text(&buf, 1), r"...\everyfind\play\");
+    }
+
     #[test]
     fn empty_query_shows_the_hint_not_a_list() {
         let app = AppState::new("");
@@ -295,6 +468,18 @@ mod tests {
         let body: String = (1..5).map(|y| row(&buf, y)).collect();
         assert!(body.contains("Enter open"), "hint missing: {body:?}");
         assert!(body.contains("Esc quit"), "hint missing: {body:?}");
+    }
+
+    /// The hint names what Enter does in this run, not what it does in the other one.
+    #[test]
+    fn the_hint_says_enter_prints_when_stdout_is_captured() {
+        let mut app = AppState::new("");
+        app.set_enter_prints(true);
+        let buf = draw(&app, 80, 6);
+        let body: String = (1..5).map(|y| row(&buf, y)).collect();
+        assert!(body.contains("Enter print"), "{body:?}");
+        assert!(body.contains("^O open"), "{body:?}");
+        assert!(!body.contains("Enter open"), "{body:?}");
     }
 
     /// The chrome (hint, separators, messages) must stay ASCII: `↑`, `·` and the em dash are

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::volume::{UsnVolume, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
 use super::arena::StringArena;
-use super::{flags, Entry, Index, ORPHAN_SENTINEL, ROOT_FRN, ROOT_SENTINEL};
+use super::{awaits_size, flags, Entry, Index, ORPHAN_SENTINEL, ROOT_FRN, ROOT_SENTINEL};
 
 /// Build an [`Index`] from every record of `vol`. `drive` is the letter used to
 /// prefix reconstructed paths (e.g. `'C'`).
@@ -46,7 +46,7 @@ pub fn build_from_volume(vol: &mut dyn UsnVolume, drive: char) -> anyhow::Result
     if let Err(e) = vol.enum_sizes(&mut |frn, alloc_clusters, truncated| {
         index.set_size(frn, alloc_clusters, truncated);
     }) {
-        // Fail-soft: keep the (complete) index; `ef du` shows 0 for unsized entries and
+        // Fail-soft: keep the (complete) index; `ef du` shows 0 for unsized files and
         // `ef status` reports the low resolved count. Never fail the build over sizes.
         tracing::warn!("size pass failed, du sizes unavailable: {e:#}");
     }
@@ -183,6 +183,9 @@ impl Builder {
         // large block that the allocator retains anyway: the opposite of the intent.
 
         let alloc_clusters = vec![0u32; self.entries.len()];
+        // Every file starts out unmeasured; the size pass that follows the build is what
+        // takes them off this count, one `set_size` at a time.
+        let unsized_files = self.entries.iter().filter(|e| awaits_size(e.flags)).count();
         Index {
             arena: self.arena,
             fold: self.fold,
@@ -194,7 +197,7 @@ impl Builder {
             dead_entries: 0,
             alloc_clusters,
             cluster_bytes: 4096,
-            sizes_resolved: 0,
+            unsized_files,
             by_fold_off: Vec::new(), // filled by rebuild_fold_map in build_from_volume
             orphans_stale: false,    // just derived, by definition in step
         }

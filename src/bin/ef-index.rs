@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     limit: usize,
 
-    /// Report disk usage (allocated on-disk size) for this path, largest children first (M5).
+    /// Report disk usage (allocated on-disk size) for this path, largest children first.
     #[arg(long, value_name = "PATH")]
     du: Option<String>,
 
@@ -217,9 +217,9 @@ fn print_stats(state: &Watched, drive: char, acquire_elapsed: Duration) {
         None => println!("process memory    : (unavailable)"),
     }
     println!(
-        "sizes resolved    : {} / {} entries",
+        "sizes resolved    : {} / {} live entries",
         state.index.sizes_resolved(),
-        s.entry_count
+        s.live_entries
     );
     println!("usn next cursor   : {}", state.next_usn);
 }

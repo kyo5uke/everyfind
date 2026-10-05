@@ -7,6 +7,7 @@
 //! discontinuity, re-enumerate from a fresh consistent snapshot. Arena garbage from
 //! rename/delete triggers the same full re-enumeration once it crosses a threshold.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,12 +17,64 @@ use crate::index::{build_from_volume, empty_index, Index};
 use crate::snapshot::{self, Loaded};
 use crate::volume::{reason, JournalError, UsnVolume, FILE_ATTRIBUTE_DIRECTORY};
 
+/// How many files one poll stats for their size.
+///
+/// A ceiling, because a bulk operation hands a single drain an unbounded list and every entry
+/// on it is a round trip into the filesystem: without one, a large copy would hold the poll
+/// loop in stats for as long as the copy lasted, and the index would fall behind the journal
+/// it exists to follow. What does not fit waits in [`Watched`]'s backlog for the polls after.
+pub const MAX_SIZE_STATS_PER_POLL: usize = 4_096;
+
 /// The live index plus the journal cursor needed to resume tailing.
 pub struct Watched {
     pub index: Index,
     pub journal_id: u64,
     pub next_usn: u64,
     drive: char,
+    /// Files whose allocation may have moved and that no poll has stat'ed yet.
+    size_backlog: SizeBacklog,
+}
+
+/// Files waiting for a size stat: oldest first, and each one at most once.
+///
+/// It exists because a size that is skipped is a size that stays wrong. The journal reports a
+/// change once, so a file dropped from one poll's list is never offered to another, and
+/// nothing short of a full enumeration looks at it again. A resumed snapshot does not run one
+/// (see [`Watched::from_snapshot`]), so in practice nothing ever did.
+///
+/// First in, first out, so that no file waits behind ones that arrived after it. The list this
+/// replaced was sorted by FRN and cut off at the budget, which starved the same high-numbered
+/// files for as long as a burst lasted.
+///
+/// It is not persisted. A daemon stopped with files still waiting comes back without them,
+/// and those keep the size they had until they change again or the index is re-enumerated.
+#[derive(Default)]
+struct SizeBacklog {
+    order: VecDeque<u64>,
+    /// The same FRNs as `order`, for the "already waiting" test. Without it, a file rewritten
+    /// every second during a long backlog would be queued, and stat'ed, once per poll.
+    waiting: HashSet<u64>,
+    /// Whether the log has been told there is a backlog, so that it hears about one when it
+    /// forms and when it clears rather than on every poll in between.
+    reported: bool,
+}
+
+impl SizeBacklog {
+    fn push(&mut self, frn: u64) {
+        if self.waiting.insert(frn) {
+            self.order.push_back(frn);
+        }
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        let frn = self.order.pop_front()?;
+        self.waiting.remove(&frn);
+        Some(frn)
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
 }
 
 /// One file's freshly measured on-disk allocation.
@@ -74,6 +127,7 @@ impl Watched {
             journal_id: 0,
             next_usn: 0,
             drive,
+            size_backlog: SizeBacklog::default(),
         }
     }
 
@@ -87,6 +141,7 @@ impl Watched {
             journal_id: r.journal_id,
             next_usn: r.next_usn,
             drive,
+            size_backlog: SizeBacklog::default(),
         })
     }
 
@@ -122,6 +177,10 @@ impl Watched {
     }
 
     /// Move a rebuilt index into place: the only half that needs exclusive access.
+    ///
+    /// The size backlog is kept. The rebuild read its sizes from the `$MFT` on disk, which
+    /// can trail a file written moments ago; a stat of whatever was still waiting costs little
+    /// and cannot be wrong, and the files that are gone drop out when their turn comes.
     pub fn adopt(&mut self, rebuilt: Rebuilt) {
         self.index = rebuilt.index;
         self.journal_id = rebuilt.journal_id;
@@ -146,6 +205,10 @@ impl Watched {
             // out-of-order fold offsets): one parallel sort here, before serving.
             let mut index = loaded.index;
             index.rebuild_fold_map();
+            // The letter the volume has now, not the one it had when the snapshot was saved.
+            // Paths are printed with it, and a path is only resolved if it names it, so an
+            // index that kept an old letter would print one drive and answer to another.
+            index.set_drive(drive);
             // A snapshot carries its sizes, so a resume skips the whole `$MFT` pass; that is
             // what makes it fast. But it carries their *absence* just as faithfully: one build
             // whose size pass came up empty saved a snapshot with zero sizes, and every restart
@@ -155,13 +218,19 @@ impl Watched {
             // service restarts in a row, each reporting `0 / 6.2M resolved`, while the fix for
             // the original size-pass failure sat unexercised because nothing ever ran it.
             //
-            // Under half resolved cannot be journal drift: a healthy build resolves ~95% and
-            // decays by a fraction of a percent per day as the journal adds unsized entries,
-            // so it means the pass itself failed, and the read is worth paying again.
-            if index.sizes_resolved() * 2 < index.len() {
+            // More than half of the files unmeasured is not something ordinary use produces.
+            // A file created after the build is measured by a stat a poll or two later and
+            // counts as measured from then on, so the number without a size stays near zero
+            // for as long as the journal is followed. Half of them missing means the pass
+            // itself failed, and the read is worth paying again.
+            //
+            // Short of that, a resume does not re-read sizes: the `du` warning says so, and
+            // says what does.
+            let (missing, files) = (index.unsized_files(), index.live_files());
+            if missing * 2 > files {
                 tracing::info!(
-                    resolved = index.sizes_resolved(),
-                    entries = index.len(),
+                    unsized_files = missing,
+                    files,
                     "resumed snapshot is missing its sizes; re-running the size pass"
                 );
                 index.restart_size_pass(vol.cluster_bytes());
@@ -176,6 +245,7 @@ impl Watched {
                 journal_id: loaded.journal_id,
                 next_usn: loaded.next_usn,
                 drive,
+                size_backlog: SizeBacklog::default(),
             })
         } else {
             tracing::warn!(
@@ -213,12 +283,13 @@ impl Watched {
         }
 
         let mut applied = 0usize;
-        // FRNs of non-delete file events, whose on-disk size may have changed (create / grow /
-        // rename). Refreshed after the drain so `ef du` stays live. USN records carry no
-        // size (probe P18), so a single-file stat is the only way to learn the new allocation.
-        let mut resized: Vec<u64> = Vec::new();
+        // Files whose on-disk size may have changed (create / grow / shrink / overwrite) join
+        // the backlog, to be stat'ed after the drain so `ef du` stays live. USN records carry
+        // no size (probe P18), so a single-file stat is the only way to learn the new
+        // allocation.
         let (start, jid) = (self.next_usn, self.journal_id);
         let index = &mut self.index;
+        let backlog = &mut self.size_backlog;
         let result = vol.read_journal(start, jid, &mut |ev| {
             index.apply_event(ev);
             applied += 1;
@@ -233,7 +304,7 @@ impl Watched {
                 && ev.reason & reason::FILE_DELETE == 0
                 && ev.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
             {
-                resized.push(ev.frn);
+                backlog.push(ev.frn);
             }
         });
         match result {
@@ -241,7 +312,7 @@ impl Watched {
                 self.next_usn = cursor;
                 Ok(Synced::Applied(Applied {
                     events: applied,
-                    resized: self.paths_to_measure(resized),
+                    resized: self.paths_to_measure(),
                 }))
             }
             Err(JournalError::EntryDeleted) => Ok(Synced::Discontinuity(
@@ -254,38 +325,51 @@ impl Watched {
         }
     }
 
-    /// Turn the FRNs collected during a drain into the `(frn, path)` pairs a size refresh
+    /// Take this poll's share of the size backlog as the `(frn, path)` pairs a size refresh
     /// needs, reconstructing each path from the just-updated index.
+    ///
+    /// At most [`MAX_SIZE_STATS_PER_POLL`] of them, oldest first. The rest stay queued and are
+    /// handed out by the polls that follow, whether or not the journal has anything new for
+    /// those polls: a quiet journal is exactly when a backlog gets worked off.
     ///
     /// The path rebuild is in-memory and belongs with the apply; the stat that follows it does
     /// not, which is why they are separate calls (see [`measure_sizes`]).
     ///
     /// [`measure_sizes`]: Self::measure_sizes
-    fn paths_to_measure(&self, mut resized: Vec<u64>) -> Vec<(u64, String)> {
-        if resized.is_empty() {
-            return Vec::new();
+    fn paths_to_measure(&mut self) -> Vec<(u64, String)> {
+        let take = self.size_backlog.len().min(MAX_SIZE_STATS_PER_POLL);
+        let mut paths = Vec::with_capacity(take);
+        for _ in 0..take {
+            let Some(frn) = self.size_backlog.pop() else {
+                break;
+            };
+            // A file deleted while it waited has no path and nothing to measure. It still
+            // counts against this poll's share, which keeps the work done here, under the
+            // caller's lock, bounded by the budget rather than by the length of the queue.
+            if let Some(path) = self.index.path_of_frn(frn) {
+                paths.push((frn, path));
+            }
         }
-        resized.sort_unstable();
-        resized.dedup();
-        // A ceiling on one poll's worth of stats, because a bulk operation can hand this an
-        // unbounded list. The sizes that do not get refreshed are not lost; the next full
-        // enumeration reconciles them, which is the same promise the fail-soft path already
-        // makes. Said out loud rather than dropped silently: a cap nobody can see reads as
+        // Said out loud rather than deferred silently: a budget nobody can see reads as
         // "everything was refreshed".
-        const MAX_PER_POLL: usize = 4_096;
-        if resized.len() > MAX_PER_POLL {
+        let waiting = self.size_backlog.len();
+        if waiting > 0 && !self.size_backlog.reported {
+            self.size_backlog.reported = true;
             tracing::info!(
-                changed = resized.len(),
-                refreshed = MAX_PER_POLL,
-                "more size changes than one poll refreshes; the rest wait for the next \
-                 enumeration"
+                waiting,
+                per_poll = MAX_SIZE_STATS_PER_POLL,
+                "more size changes than one poll stats; the rest carry over to the next polls"
             );
-            resized.truncate(MAX_PER_POLL);
+        } else if waiting == 0 && self.size_backlog.reported {
+            self.size_backlog.reported = false;
+            tracing::info!("the size backlog is worked off");
         }
-        resized
-            .into_iter()
-            .filter_map(|frn| self.index.path_of_frn(frn).map(|path| (frn, path)))
-            .collect()
+        paths
+    }
+
+    /// How many files are still waiting for a size stat.
+    pub fn sizes_pending(&self) -> usize {
+        self.size_backlog.len()
     }
 
     /// Stat each changed file to learn its new on-disk allocation.
@@ -293,9 +377,10 @@ impl Watched {
     /// Borrows no index, so a caller keeping one behind a lock runs this with the lock
     /// released. That is not a nicety: each entry is a `CreateFileW` +
     /// `GetFileInformationByHandleEx` x2 + `CloseHandle` through whatever filter drivers are
-    /// installed, and one `cargo build` on the indexed volume fills the whole 4,096-entry
-    /// budget on every poll: held exclusively, that is seconds of blocked searches per second
-    /// of compiling, on a tool whose premise is a forty-millisecond search.
+    /// installed, and one `cargo build` on the indexed volume fills the whole
+    /// [`MAX_SIZE_STATS_PER_POLL`] budget on every poll: held exclusively, that is seconds of
+    /// blocked searches per second of compiling, on a tool whose premise is a
+    /// forty-millisecond search.
     ///
     /// Fail-soft: a file that no longer stats (deleted in the race between the apply and here)
     /// is simply left out, and keeps whatever size it had until the next full enumeration.
@@ -367,6 +452,9 @@ pub fn run(state: &mut Watched, vol: &mut dyn UsnVolume, opts: &WatchOpts) -> Re
         // job's two halves are simply run together.
         let why = match state.sync(vol)? {
             Synced::Applied(a) if a.events == 0 => {
+                // No events, but possibly sizes: the backlog a burst leaves behind is worked
+                // off by exactly these quiet polls, and what they learn is a change to save.
+                dirty |= !a.resized.is_empty();
                 state.refresh_sizes(vol, &a.resized);
                 None
             }
