@@ -1,12 +1,12 @@
 {
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Instant filename search for Windows, in your terminal (NTFS MFT + USN journal)",
     "homepage": "https://github.com/kyo5uke/everyfind",
     "license": "MIT OR Apache-2.0",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/kyo5uke/everyfind/releases/download/v0.1.0/everyfind-x86_64-pc-windows-msvc-v0.1.0.zip",
-            "hash": "277704f080236f6df165f50027c14e8e6517b951c943aa03017dc7fa4f353990"
+            "url": "https://github.com/kyo5uke/everyfind/releases/download/v0.1.1/everyfind-x86_64-pc-windows-msvc-v0.1.1.zip",
+            "hash": "f196e01ea1d064980e5743b465583ccfcfdee6d93ebf8da217f9cc0c50ea6b1c"
         }
     },
     "bin": [
